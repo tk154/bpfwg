@@ -7,7 +7,7 @@
 #include <bpf/bpf_endian.h>
 #include <sys/socket.h>
 
-#define MAX_MTU 4096
+#define MAX_MTU 9000
 
 
 struct packet_data {

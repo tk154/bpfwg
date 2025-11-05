@@ -90,13 +90,13 @@ int __tc_wg(struct __sk_buff *skb, bool udp_check)
 }
 
 
-SEC("xdp")
+SEC("xdp.frags")
 int xdp_wg(struct xdp_md *xdp)
 {
     return __xdp_wg(xdp, true);
 }
 
-SEC("xdp")
+SEC("xdp.frags")
 int xdp_wg_nocheck(struct xdp_md *xdp)
 {
     return __xdp_wg(xdp, false);
