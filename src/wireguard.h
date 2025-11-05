@@ -118,7 +118,8 @@ int wg_encrypt(struct packet_data *pkt, struct packet_header *header, int wg_ifi
     if (!bpf_adjust_packet(pkt, header_len, trailer_len, family))
         goto bpf_wg_peer_put;
 
-    ret = pkt->is_xdp ? bpf_xdp_wg_encrypt(pkt->ctx, wg_offset, wg_len, wg_peer) :
+    ret = pkt->is_xdp ?
+        bpf_xdp_wg_encrypt(pkt->ctx, wg_offset, wg_len, wg_peer):
         bpf_skb_wg_encrypt(pkt->ctx, wg_offset, wg_len, wg_peer);
 
     if (ret) {
@@ -170,7 +171,8 @@ int wg_decrypt(struct packet_data *pkt, struct packet_header *header)
     wgh_offset = header->l3.offset + iph_len + sizeof(struct udphdr);
     payload_len = header->l4.payload_len;
 
-    ret = pkt->is_xdp ? bpf_xdp_wg_decrypt(pkt->ctx, wgh_offset, payload_len, wg_peer) :
+    ret = pkt->is_xdp ?
+        bpf_xdp_wg_decrypt(pkt->ctx, wgh_offset, payload_len, wg_peer):
         bpf_skb_wg_decrypt(pkt->ctx, wgh_offset, payload_len, wg_peer);
 
     if (ret) {

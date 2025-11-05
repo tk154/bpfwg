@@ -18,10 +18,9 @@
 __always_inline static
 __sum16 ip_checksum(struct iphdr *iph)
 {
-    int num_u32 = sizeof(*iph) >> 2;
+    int i, num_u32 = sizeof(*iph) >> 2;
     __u32 *data = (__u32 *)iph;
     __u64 sum = 0;
-    int i;
 
     iph->check = 0;
 
@@ -35,7 +34,6 @@ __sum16 ip_checksum(struct iphdr *iph)
 
     return sum;
 }
-
 
 __always_inline static
 __sum16 udp_checksum(struct udphdr *udph, int len, __u64 sum, void *data_end)
@@ -193,9 +191,9 @@ bool create_udp6_tunnel(void *data, void *data_end,
 
 __always_inline static
 bool create_udp_tunnel(void *data, void *data_end, sa_family_t family,
-                       struct bpf_sock_tuple *tuple, __u16 tot_len, bool udp_csum)
+                       struct bpf_sock_tuple *tuple, __u16 tot_len, bool udp_check)
 {
-    return family == AF_INET ? create_udp4_tunnel(data, data_end, tuple, tot_len, udp_csum):
+    return family == AF_INET ? create_udp4_tunnel(data, data_end, tuple, tot_len, udp_check):
                                create_udp6_tunnel(data, data_end, tuple, tot_len);
 }
 
