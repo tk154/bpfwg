@@ -127,8 +127,7 @@ int wg_encrypt(struct packet_data *pkt, struct packet_header *header, int wg_ifi
         goto bpf_wg_peer_put;
     }
 
-    if (!create_udp_tunnel(pkt->data + iph_offset, pkt->data_end,
-            family, &tuple, tot_len, udp_check))
+    if (!create_udp_tunnel(pkt, family, &tuple, iph_offset, tot_len, udp_check))
         goto bpf_wg_peer_put;
 
     out_ifindex = output(pkt, family, 0);
