@@ -147,11 +147,17 @@ enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
 
     wg_decrypt_build_layout(header, &layout);
 
-    if (!bpf_wg_decrypt(pkt, wg_peer, &layout))
-        goto bpf_wg_peer_put;
+    if (!bpf_wg_decrypt(pkt, wg_peer, &layout)) {
+        /* Workaround for !read_ok */
+        bpf_wg_peer_put(wg_peer);
+        goto bpf_wg_device_put;
+    }
 
-    if (!wg_parse_inner_l3(pkt, header, &layout, inner))
-        goto bpf_wg_peer_put;
+    if (!wg_parse_inner_l3(pkt, header, &layout, inner)) {
+        /* Workaround for !read_ok */
+        bpf_wg_peer_put(wg_peer);
+        goto bpf_wg_device_put;
+    }
 
     if (!wg_source_allowed(wg_device, wg_peer, inner))
         goto bpf_wg_peer_put;
