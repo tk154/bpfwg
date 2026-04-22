@@ -1,13 +1,13 @@
-From d2f1755547a4143a3a3511f3443d83771738c26b Mon Sep 17 00:00:00 2001
+From 396acbc1c494fbc72699e90f64895c60d20c204a Mon Sep 17 00:00:00 2001
 From: Til Kaiser <mail@tk154.de>
-Date: Wed, 14 Jan 2026 21:39:54 +0100
-Subject: [PATCH 2/2] wireguard: add eBPF support
+Date: Tue, 14 Apr 2026 13:38:16 +0200
+Subject: [PATCH 3/3] wireguard: add eBPF support
 
 ---
  drivers/net/wireguard/Makefile     |   7 +
  drivers/net/wireguard/allowedips.c |  11 +
  drivers/net/wireguard/allowedips.h |   2 +
- drivers/net/wireguard/bpf.c        | 385 +++++++++++++++++++++++++++++
+ drivers/net/wireguard/bpf.c        | 372 +++++++++++++++++++++++++++++
  drivers/net/wireguard/bpf.h        |  18 ++
  drivers/net/wireguard/device.c     |  38 +++
  drivers/net/wireguard/device.h     |   6 +
@@ -16,9 +16,7 @@ Subject: [PATCH 2/2] wireguard: add eBPF support
  drivers/net/wireguard/noise.h      |   6 +
  drivers/net/wireguard/receive.c    |  10 +
  drivers/net/wireguard/send.c       |   5 +
- include/linux/filter.h             |   8 +
- net/core/filter.c                  |  55 +++++
- 14 files changed, 559 insertions(+), 1 deletion(-)
+ 12 files changed, 483 insertions(+), 1 deletion(-)
  create mode 100644 drivers/net/wireguard/bpf.c
  create mode 100644 drivers/net/wireguard/bpf.h
 
@@ -75,10 +73,10 @@ index 2346c797eb4d..e768e1801f64 100644
  bool wg_allowedips_selftest(void);
 diff --git a/drivers/net/wireguard/bpf.c b/drivers/net/wireguard/bpf.c
 new file mode 100644
-index 000000000000..1141db3e54b4
+index 000000000000..3f4f9d4d4c56
 --- /dev/null
 +++ b/drivers/net/wireguard/bpf.c
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,372 @@
 +#include <linux/btf.h>
 +#include <linux/filter.h>
 +#include <linux/netdevice.h>
@@ -93,15 +91,6 @@ index 000000000000..1141db3e54b4
 +/*BTF_ID_LIST(btf_wg_ids)
 +BTF_ID(struct, wg_device)
 +BTF_ID(struct, wg_peer)*/
-+
-+static inline void
-+in6_addr_to_be32_array(__be32 dst[4], const struct in6_addr *src)
-+{
-+	dst[0] = src->in6_u.u6_addr32[0];
-+	dst[1] = src->in6_u.u6_addr32[1];
-+	dst[2] = src->in6_u.u6_addr32[2];
-+	dst[3] = src->in6_u.u6_addr32[3];
-+}
 +
 +__bpf_kfunc_start_defs();
 +
@@ -146,14 +135,10 @@ index 000000000000..1141db3e54b4
 +__bpf_kfunc struct wg_peer *
 +bpf_wg_peer_hashtable_lookup(struct wg_device *wg, __le32 idx)
 +{
-+	struct noise_keypair *keypair;
 +	struct wg_peer *peer = NULL;
 +
-+	keypair =
-+		(struct noise_keypair *)wg_index_hashtable_lookup(
-+			wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx,
-+			&peer);
-+	if (likely(keypair && !READ_ONCE(peer->is_dead)))
++	wg_index_hashtable_lookup(wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx, &peer);
++	if (likely(peer && !READ_ONCE(peer->is_dead)))
 +		return peer;
 +
 +	wg_peer_put(peer);
@@ -194,8 +179,8 @@ index 000000000000..1141db3e54b4
 +			break;
 +
 +		case AF_INET6:
-+			in6_addr_to_be32_array(tuple->ipv6.daddr, &endpoint->addr6.sin6_addr);
-+			in6_addr_to_be32_array(tuple->ipv6.saddr, &endpoint->src6);
++			memcpy(tuple->ipv6.daddr, &endpoint->addr6.sin6_addr, sizeof(tuple->ipv6.daddr));
++			memcpy(tuple->ipv6.saddr, &endpoint->src6, sizeof(tuple->ipv6.saddr));
 +			tuple->ipv6.dport = endpoint->addr6.sin6_port;
 +			tuple->ipv6.sport = sport;
 +			ret = AF_INET6;
@@ -218,7 +203,7 @@ index 000000000000..1141db3e54b4
 +	int ret = 0;
 +	u64 nonce;
 +
-+	if (unlikely(length < message_data_len(MESSAGE_PADDING_MULTIPLE) ||
++	if (unlikely(/*length < message_data_len(MESSAGE_PADDING_MULTIPLE) ||*/
 +			length != ALIGN(length, MESSAGE_PADDING_MULTIPLE)))
 +		return -EINVAL;
 +
@@ -651,98 +636,6 @@ index 26e09c30d596..0ac5e452368e 100644
  static unsigned int calculate_skb_padding(struct sk_buff *skb)
  {
  	unsigned int padded_size, last_unit = skb->len;
-diff --git a/include/linux/filter.h b/include/linux/filter.h
-index a91f2babf425..0d4eef6ae734 100644
---- a/include/linux/filter.h
-+++ b/include/linux/filter.h
-@@ -1772,6 +1772,8 @@ int __bpf_xdp_store_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len);
- void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len);
- void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
- 		      void *buf, unsigned long len, bool flush);
-+int bpf_xdp_to_sgvec(struct xdp_buff *xdp, struct scatterlist *sg,
-+			  u32 offset, u32 len);
- #else /* CONFIG_NET */
- static inline int __bpf_skb_load_bytes(const struct sk_buff *skb, u32 offset,
- 				       void *to, u32 len)
-@@ -1806,6 +1808,12 @@ static inline void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off, voi
- 				    unsigned long len, bool flush)
- {
- }
-+
-+static inline int bpf_xdp_to_sgvec(struct xdp_buff *xdp, struct scatterlist *sg,
-+					u32 offset, u32 len)
-+{
-+	return -EOPNOTSUPP;
-+}
- #endif /* CONFIG_NET */
- 
- #endif /* __LINUX_FILTER_H__ */
-diff --git a/net/core/filter.c b/net/core/filter.c
-index 01c9952ca3ca..478bd156f552 100644
---- a/net/core/filter.c
-+++ b/net/core/filter.c
-@@ -4076,6 +4076,61 @@ void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
- 	return offset + len <= size ? addr + offset : NULL;
- }
- 
-+int bpf_xdp_to_sgvec(struct xdp_buff *xdp, struct scatterlist *sg,
-+               	   	 u32 offset, u32 len)
-+{
-+    struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
-+    int start = xdp->data_end - xdp->data;
-+    int i, copy = start - offset;
-+    int elt = 0;
-+
-+    /* Linear part in xdp->data..data_end */
-+    if (copy > 0) {
-+        if (copy > len)
-+            copy = len;
-+        sg_set_buf(sg, xdp->data + offset, copy);
-+        elt++;
-+        if ((len -= copy) == 0)
-+            goto out;
-+        offset += copy;
-+    }
-+
-+	if (!xdp_buff_has_frags(xdp))
-+		goto out;
-+
-+    /* Page frags from xdp_shared_info */
-+    for (i = 0; i < sinfo->nr_frags; i++) {
-+        int end;
-+
-+		WARN_ON(start > offset + len);
-+
-+		end = start + skb_frag_size(&sinfo->frags[i]);
-+        if ((copy = end - offset) > 0) {
-+            skb_frag_t *frag = &sinfo->frags[i];
-+			if (unlikely(elt && sg_is_last(&sg[elt - 1])))
-+				return -EMSGSIZE;
-+
-+            if (copy > len)
-+                copy = len;
-+            sg_set_page(&sg[elt], skb_frag_page(frag), copy,
-+                        skb_frag_off(frag) + offset - start);
-+            elt++;
-+            if (!(len -= copy))
-+                goto out;
-+            offset += copy;
-+        }
-+        start = end;
-+    }
-+
-+out:
-+	if (elt)
-+    	sg_mark_end(&sg[elt - 1]);
-+
-+    BUG_ON(len);
-+    return elt;
-+}
-+EXPORT_SYMBOL_GPL(bpf_xdp_to_sgvec);
-+
- BPF_CALL_4(bpf_xdp_load_bytes, struct xdp_buff *, xdp, u32, offset,
- 	   void *, buf, u32, len)
- {
 -- 
-2.52.0
+2.53.0
 
