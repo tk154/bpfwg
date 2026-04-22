@@ -14,11 +14,34 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "dsa.h"
+
 
 __u32 bpf_xdp_checksum(struct xdp_md *xdp, __u32 offset,
                        __u32 len, __u32 csum) __ksym;
 __u32 bpf_skb_checksum(struct __sk_buff *skb, __u32 offset,
                        __u32 len, __u32 csum) __ksym;
+
+
+__always_inline static
+__u32 push_eth_header(struct ethhdr *ethh, struct packet_data *pkt, struct bpf_fib_lookup *fib)
+{
+    __push_eth_header(ethh, pkt, fib);
+    return fib->ifindex;
+}
+
+__always_inline static
+__u32 push_l2_header(void *l2, struct packet_data *pkt, struct bpf_fib_lookup *fib)
+{
+    switch (config.dsa_proto) {
+        case DSA_PROTO_NONE:
+            return push_eth_header(l2, pkt, fib);
+        case DSA_PROTO_MTK:
+            return push_mtk_header(l2, pkt, fib);
+        default:
+            return -1;
+    }
+}
 
 __always_inline static
 __sum16 ip_checksum(struct iphdr *iph)
@@ -44,7 +67,7 @@ __always_inline static
 __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __u64 sum)
 {
     struct udphdr *udph;
-    
+
     udph = pkt->data + offset;
     if ((void *)(udph + 1) > pkt->data_end)
         return 0;
@@ -62,7 +85,10 @@ __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __u64 sum)
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = ~sum & 0xFFFF;
 
-    return sum ? sum : 0xFFFF;
+    if (!sum)
+        sum = 0xFFFF;
+
+    return (__sum16)sum;
 }
 
 __always_inline static
@@ -110,7 +136,7 @@ __sum16 udp_v6_checksum(struct packet_data *pkt, __u8 offset, __u16 len,
 
 __always_inline static
 bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
-                        __u8 iph_offset, __u16 tot_len, bool udp_check)
+                        __u8 iph_offset, __u16 tot_len)
 {
     struct iphdr *ip4h = pkt->data + iph_offset;
     __u16 udp_off = iph_offset + sizeof(*ip4h);
@@ -139,15 +165,14 @@ bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
     udph->dest = tuple->ipv4.dport;
     udph->len = bpf_htons(udp_len);
 
-    if (udp_check) {
-        udph->check = udp_v4_checksum(pkt, iph_offset + sizeof(*ip4h), udp_len, ip4h->saddr, ip4h->daddr);
+    if (config.udp_check) {
+        udph->check = udp_v4_checksum(pkt, iph_offset + sizeof(*ip4h), udp_len,
+                                ip4h->saddr, ip4h->daddr);
         if (!udph->check) {
             bpf_printk("udp_v4_checksum error");
             return false;
         }
     }
-    else
-        udph->check = 0;
 
     return true;
 }
@@ -179,8 +204,9 @@ bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple, _
     udph->source = tuple->ipv6.sport;
     udph->dest = tuple->ipv6.dport;
     udph->len = payload_len;
-    udph->check = udp_v6_checksum(pkt, iph_offset + sizeof(*ip6h), udp_len, &ip6h->saddr, &ip6h->daddr);
 
+    udph->check = udp_v6_checksum(pkt, iph_offset + sizeof(*ip6h), udp_len,
+                            &ip6h->saddr, &ip6h->daddr);
     if (!udph->check) {
         bpf_printk("udp_v6_checksum error");
         return false;
@@ -190,16 +216,16 @@ bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple, _
 }
 
 __always_inline static
-bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family, struct bpf_sock_tuple *tuple,
-                       __u8 iph_offset, __u16 tot_len, bool udp_check)
+bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family,
+                struct bpf_sock_tuple *tuple, __u8 iph_offset, __u16 tot_len)
 {
-    return family == AF_INET ? create_udp4_tunnel(pkt, tuple, iph_offset, tot_len, udp_check):
+    return family == AF_INET ? create_udp4_tunnel(pkt, tuple, iph_offset, tot_len):
                                create_udp6_tunnel(pkt, tuple, iph_offset, tot_len);
 }
 
 
 __always_inline static
-__u32 output(struct packet_data *pkt, sa_family_t family, __u16 offset)
+int output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_len)
 {
     struct ethhdr *ethh = pkt->data + offset;
     struct bpf_fib_lookup fib = {};
@@ -211,7 +237,7 @@ __u32 output(struct packet_data *pkt, sa_family_t family, __u16 offset)
     if (family == AF_INET) {
         struct iphdr *ip4h = (struct iphdr *)(ethh + 1);
         if ((void *)(ip4h + 1) > pkt->data_end)
-            return 0;
+            return -1;
 
         fib.ipv4_src = ip4h->saddr;
         fib.ipv4_dst = ip4h->daddr;
@@ -221,7 +247,7 @@ __u32 output(struct packet_data *pkt, sa_family_t family, __u16 offset)
     else {
         struct ipv6hdr *ip6h = (struct ipv6hdr *)(ethh + 1);
         if ((void *)(ip6h + 1) > pkt->data_end)
-            return 0;
+            return -1;
 
         ip6cpy(fib.ipv6_src, ip6h->saddr.in6_u.u6_addr32);
         ip6cpy(fib.ipv6_dst, ip6h->daddr.in6_u.u6_addr32);
@@ -232,7 +258,7 @@ __u32 output(struct packet_data *pkt, sa_family_t family, __u16 offset)
     ret = bpf_fib_lookup(pkt->ctx, &fib, sizeof(fib), 0);
     if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
         if (ret != BPF_FIB_LKUP_RET_NOT_FWDED)
-            bpf_printk("bpf_fib_lookup: %d", ret);
+            bpf_printk("%s: bpf_fib_lookup: %d", __func__, ret);
 
         if (offset)
             memmove(pkt->data + offset, pkt->data, 2 * ETH_ALEN);
@@ -240,10 +266,7 @@ __u32 output(struct packet_data *pkt, sa_family_t family, __u16 offset)
         return 0;
     }
 
-    memcpy(ethh->h_dest, fib.dmac, ETH_ALEN);
-    memcpy(ethh->h_source, fib.smac, ETH_ALEN);
-
-    return fib.ifindex;
+    return push_l2_header(ethh, pkt, &fib);
 }
 
 

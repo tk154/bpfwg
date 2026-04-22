@@ -9,13 +9,99 @@
 #include <bpf/bpf_helpers.h>
 
 #include "common_kern.h"
+#include "config.h"
+
 #include "receive.h"
 #include "transmit.h"
 #include "wireguard.h"
 
+#include "conntrack.h"
+#include "rss.h"
+
 
 __always_inline static
-int wg_func(struct packet_data *pkt, bool udp_check)
+int wg_encrypt_path(struct packet_data *pkt, struct packet_header *header,
+                    int wg_ifindex)
+{
+    struct wg_encrypt_endpoint endpoint;
+    enum wg_action action;
+    int out;
+
+    if (config.conntrack) {
+        if (!parse_l4_header(pkt, header->l3.proto, &header->l4) ||
+                !conntrack_lookup_from_header(pkt, &header->l3, &header->l4)) {
+            //bpf_printk("before");
+            return WG_ACTION_PASS;
+        }
+    }
+
+    action = wg_encrypt(pkt, header, wg_ifindex, &endpoint);
+    if (action != WG_ACTION_REDIRECT)
+        return action;
+
+    if (config.conntrack) {
+        if (!conntrack_lookup_from_tuple(pkt, &endpoint.tuple, endpoint.family, IPPROTO_UDP)) {
+            //bpf_printk("after");
+            return WG_ACTION_PASS;
+        }
+    }
+
+    out = output(pkt, endpoint.family, 0, header->l3.offset);
+    if (out <= 0)
+        bpf_printk("%s: out = %d", __func__, out);
+
+    return out;
+}
+
+__always_inline static
+int wg_decrypt_path(struct packet_data *pkt, struct packet_header *header)
+{
+    struct wg_decrypt_inner inner;
+    enum wg_action action;
+    int out_ifindex;
+
+    if (header->l3.proto != IPPROTO_UDP ||
+            !parse_udp_header(pkt, &header->l4))
+        return WG_ACTION_PASS;
+
+    if (header->l4.payload_len < WG_DECRYPT_MINIMUM_LEN ||
+            !parse_wg_header(pkt, &header->wg))
+        return WG_ACTION_PASS;
+
+    if (config.conntrack) {
+        if (!conntrack_lookup_from_header(pkt, &header->l3, &header->l4)) {
+            //bpf_printk("before");
+            return WG_ACTION_PASS;
+        }
+    }
+
+    action = wg_decrypt(pkt, header, &inner);
+    if (action != WG_ACTION_REDIRECT)
+        return action;
+
+    if (config.conntrack) {
+        if (!parse_l4_header(pkt, inner.l3.proto, &inner.l4) ||
+                !conntrack_lookup_from_header(pkt, &inner.l3, &inner.l4)) {
+            //bpf_printk("after");
+            if (pkt->is_xdp)
+                memmove(pkt->data + inner.header_len, pkt->data, 2 * ETH_ALEN + 2);
+            goto bpf_adjust_packet;
+        }
+    }
+
+    out_ifindex = output(pkt, inner.l3.family, pkt->is_xdp ? inner.header_len : 0, header->l3.offset);
+    if (out_ifindex <= 0)
+        bpf_printk("%s: out = %d", __func__, out_ifindex);
+
+bpf_adjust_packet:
+    if (!bpf_adjust_packet(pkt, -inner.header_len, -inner.trailer_len, inner.l3.family))
+        return WG_ACTION_DROP;
+
+    return out_ifindex;
+}
+
+__always_inline static
+int wg_process_packet(struct packet_data *pkt)
 {
     struct packet_header header;
     int ifindex;
@@ -25,94 +111,73 @@ int wg_func(struct packet_data *pkt, bool udp_check)
         return 0;
 
     ifindex = fib_lookup(pkt, &header.l3);
-
-    if (ifindex > 0) {
-        if (header.l3.tot_len > MAX_MTU)
-            return 0;
-
-        return wg_encrypt(pkt, &header, ifindex, udp_check);
-    }
-    else if (!ifindex) {
-        if (!parse_l4_header(pkt, header.l3.proto, &header.l4) ||
-                header.l4.payload_len < WG_DECRYPT_MINIMUM_LEN ||
-                !parse_wg_header(pkt, &header.wg))
-            return 0;
-
-        return wg_decrypt(pkt, &header);
-    }
-
-    return 0;
+    if (ifindex > 0)
+        return wg_encrypt_path(pkt, &header, ifindex);
+    if (ifindex == 0)
+        return wg_decrypt_path(pkt, &header);
+    return WG_ACTION_PASS;
 }
 
 
 __always_inline static
-int __xdp_wg(struct xdp_md *xdp, bool udp_check)
+int __xdp_wg(struct xdp_md *xdp)
 {
-	struct packet_data pkt = {
-        .ctx        = (void *)xdp,
-		.data 	  	= (void *)(long)xdp->data,
-		.data_end 	= (void *)(long)xdp->data_end,
-        .p          = (void *)(long)xdp->data,
-        .ifindex    = xdp->ingress_ifindex,
-        .is_xdp     = true
-	};
+    struct packet_data pkt = {
+        .ctx = (void *)xdp,
+        .data = (void *)(long)xdp->data,
+        .data_end = (void *)(long)xdp->data_end,
+        .p = (void *)(long)xdp->data,
+        .ifindex = xdp->ingress_ifindex,
+        .is_xdp = true,
+    };
+    int out_ifindex;
 
-    int out_ifindex = wg_func(&pkt, udp_check);
-
+    out_ifindex = wg_process_packet(&pkt);
     if (out_ifindex > 0)
         return bpf_redirect(out_ifindex, 0);
-    if (out_ifindex < 0)
-        return XDP_DROP;
-
-    return XDP_PASS;
+    if (out_ifindex == 0)
+        return XDP_PASS;
+    return XDP_DROP;
 }
 
 __always_inline static
-int __tc_wg(struct __sk_buff *skb, bool udp_check)
+int __tc_wg(struct __sk_buff *skb)
 {
-	struct packet_data pkt = {
-        .ctx        = (void *)skb,
-		.data 	  	= (void *)(long)skb->data,
-		.data_end 	= (void *)(long)skb->data_end,
-        .p          = (void *)(long)skb->data,
-        .ifindex    = skb->ingress_ifindex,
-        .is_xdp     = false
-	};
+    struct packet_data pkt = {
+        .ctx = (void *)skb,
+        .data = (void *)(long)skb->data,
+        .data_end = (void *)(long)skb->data_end,
+        .p = (void *)(long)skb->data,
+        .ifindex = skb->ingress_ifindex,
+        .is_xdp = false,
+    };
+    int out_ifindex;
 
-    int out_ifindex = wg_func(&pkt, udp_check);
-
+    out_ifindex = wg_process_packet(&pkt);
     if (out_ifindex > 0)
         return bpf_redirect(out_ifindex, 0);
-    if (out_ifindex < 0)
-        return TC_ACT_SHOT;
-
-    return TC_ACT_UNSPEC;
+    if (out_ifindex == 0)
+        return TC_ACT_UNSPEC;
+    return TC_ACT_SHOT;
 }
 
 
 SEC("xdp.frags")
 int xdp_wg(struct xdp_md *xdp)
 {
-    return __xdp_wg(xdp, true);
+    return __xdp_wg(xdp);
 }
 
-SEC("xdp.frags")
-int xdp_wg_nocheck(struct xdp_md *xdp)
+SEC("xdp/cpumap")
+int xdp_wg_cpumap(struct xdp_md *xdp)
 {
-    return __xdp_wg(xdp, false);
+    return __xdp_wg(xdp);
 }
-
 
 SEC("tc")
 int tc_wg(struct __sk_buff *skb)
 {
-    return __tc_wg(skb, true);
-}
-
-SEC("tc")
-int tc_wg_nocheck(struct __sk_buff *skb)
-{
-    return __tc_wg(skb, false);
+    return __tc_wg(skb);
 }
 
 

@@ -7,63 +7,23 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/udp.h>
+#include <linux/tcp.h>
 
 #include <sys/socket.h>
 
 #include "endian.h"
-
+#include "dsa.h"
 
 #define IP_VERSION(ip)	(*(__u8 *)(ip) >> 4)
 #define WG_MESSAGE_DATA bpf_le32_to_cpu(4)
-
-// Helper macro to make the out-of-bounds check on a packet header
-#define check_header(hdr, pkt) \
-    do { \
-        hdr = pkt->p; \
-        pkt->p += sizeof(*hdr); \
-        if (pkt->p > pkt->data_end) { \
-            bpf_printk(#hdr" > data_end"); \
-            return false; \
-        } \
-    } while (0);
-
-
-struct l2_header {
-    __be16 proto;
-};
-
-struct l3_header {
-    __be32 *src_ip, *dest_ip;
-    __u16 tot_len;
-    __u8 family, proto, offset;
-};
-
-struct l4_header {
-	__be16 dest_port;
-    __u16 payload_len;
-};
-
-struct wg_header {
-    __le32 type;
-    __le32 receiver;
-    __le64 counter;
-};
-
-struct packet_header {
-    struct l2_header  l2;
-    struct l3_header  l3;
-    struct l4_header  l4;
-    struct wg_header *wg;
-};
 
 
 __always_inline static
 bool parse_eth_header(struct packet_data *pkt, struct l2_header *l2)
 {
     struct ethhdr *ethh;
-    check_header(ethh, pkt);
+    __parse_eth_header(ethh, pkt, l2);
 
-    l2->proto = ethh->h_proto;
     return true;
 }
 
@@ -71,7 +31,7 @@ __always_inline static
 bool parse_ipv4_header(struct packet_data *pkt, struct l3_header *l3)
 {
     struct iphdr *ip4h;
-    check_header(ip4h, pkt);
+    parse_header(ip4h, pkt);
 
     l3->family  = AF_INET;
 	l3->src_ip  = &ip4h->saddr;
@@ -87,7 +47,7 @@ __always_inline static
 bool parse_ipv6_header(struct packet_data *pkt, struct l3_header *l3)
 {
     struct ipv6hdr *ip6h;
-    check_header(ip6h, pkt);
+    parse_header(ip6h, pkt);
 
     l3->family  = AF_INET6;
 	l3->src_ip  = ip6h->saddr.in6_u.u6_addr32;
@@ -100,11 +60,24 @@ bool parse_ipv6_header(struct packet_data *pkt, struct l3_header *l3)
 }
 
 __always_inline static
+bool parse_tcp_header(struct packet_data *pkt, struct l4_header *l4)
+{
+	struct tcphdr *tcph;
+	parse_header(tcph, pkt);
+
+    l4->src_port = tcph->source;
+	l4->dest_port = tcph->dest;
+
+	return true;
+}
+
+__always_inline static
 bool parse_udp_header(struct packet_data *pkt, struct l4_header *l4)
 {
 	struct udphdr *udph;
-	check_header(udph, pkt);
+	parse_header(udph, pkt);
 
+    l4->src_port = udph->source;
 	l4->dest_port = udph->dest;
 	l4->payload_len = bpf_ntohs(udph->len) - sizeof(*udph);
 
@@ -115,7 +88,7 @@ __always_inline static
 bool parse_wg_header(struct packet_data *pkt, struct wg_header **wg)
 {
     struct wg_header *wg_header;
-    check_header(wg_header, pkt);
+    parse_header(wg_header, pkt);
 
     if (wg_header->type != WG_MESSAGE_DATA)
         return false;
@@ -128,7 +101,14 @@ bool parse_wg_header(struct packet_data *pkt, struct wg_header **wg)
 __always_inline static
 bool parse_l2_header(struct packet_data *pkt, struct l2_header *l2)
 {
-    return parse_eth_header(pkt, l2);
+    switch (config.dsa_proto) {
+        case DSA_PROTO_NONE:
+            return parse_eth_header(pkt, l2);
+        case DSA_PROTO_MTK:
+            return parse_mtk_header(pkt, l2);
+        default:
+            return false;
+    }
 }
 
 __always_inline static
@@ -139,10 +119,8 @@ bool parse_l3_header(struct packet_data *pkt, __be16 proto, struct l3_header *l3
 	switch (proto) {
 		case bpf_ntohs(ETH_P_IP):
 			return parse_ipv4_header(pkt, l3);
-
         case bpf_ntohs(ETH_P_IPV6):
             return parse_ipv6_header(pkt, l3);
-
 		default:
 			return false;
 	}
@@ -151,7 +129,14 @@ bool parse_l3_header(struct packet_data *pkt, __be16 proto, struct l3_header *l3
 __always_inline static
 bool parse_l4_header(struct packet_data *pkt, __u8 proto, struct l4_header *l4)
 {
-    return proto == IPPROTO_UDP ? parse_udp_header(pkt, l4) : false;
+	switch (proto) {
+		case IPPROTO_TCP:
+			return parse_tcp_header(pkt, l4);
+		case IPPROTO_UDP:
+			return parse_udp_header(pkt, l4);
+		default:
+			return false;
+	}
 }
 
 
@@ -181,6 +166,7 @@ int fib_lookup(struct packet_data *pkt, struct l3_header *l3)
         case BPF_FIB_LKUP_RET_NOT_FWDED:
             return 0;
         default:
+            //bpf_printk("%s: %d", __func__, ret);
             return -1;
     }
 }
