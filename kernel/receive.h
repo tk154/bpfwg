@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 
 #include "endian.h"
-#include "dsa.h"
+#include "dsa/dsa.h"
 
 #define IP_VERSION(ip)	(*(__u8 *)(ip) >> 4)
 #define WG_MESSAGE_DATA bpf_le32_to_cpu(4)
@@ -165,6 +165,9 @@ int fib_lookup(struct packet_data *pkt, struct l3_header *l3)
             return fib.ifindex;
         case BPF_FIB_LKUP_RET_NOT_FWDED:
             return 0;
+        case BPF_FIB_LKUP_RET_FRAG_NEEDED:
+            bpf_printk("Fragmentation required: len = %u, mtu = %u",
+                l3->tot_len, fib.tot_len);
         default:
             //bpf_printk("%s: %d", __func__, ret);
             return -1;

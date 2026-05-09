@@ -1,11 +1,6 @@
-#ifndef DSA_H
-#define DSA_H
-
 #include <linux/bits.h>
 #include <linux/if_ether.h>
 
-
-/* MTK */
 #define MTK_DSA_SWITCH_IFINDEX  2
 #define MTK_DSA_PORTS_OFFSET    4
 
@@ -47,6 +42,9 @@ __u32 push_mtk_header(struct mtkhdr *mtkh, struct packet_data *pkt, struct bpf_f
 
     return MTK_DSA_SWITCH_IFINDEX;
 }
-/* END MTK */
 
-#endif
+__always_inline static
+void restore_mtk_header(struct packet_data *pkt, __u16 offset)
+{
+    memmove(pkt->data + offset, pkt->data, sizeof(struct mtkhdr));
+}

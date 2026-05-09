@@ -63,7 +63,7 @@ bool wg_encrypt_resolve_endpoint(struct wg_peer *wg_peer,
             endpoint->iph_len = sizeof(struct ipv6hdr);
             return true;
         default:
-            bpf_printk("bpf_wg_endpoint_tuple_get error: %d", family);
+            bpf_printk("bpf_wg_endpoint_tuple_get: %d", family);
             return false;
     }
 }
@@ -105,16 +105,16 @@ int bpf_wg_encrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
         case 0:
             return true;
         case -ENOKEY:
-            bpf_printk("%s: key not available", __func__);
+            bpf_printk("bpf_wg_decrypt: key not available");
             return false;
         case -EKEYEXPIRED:
-            bpf_printk("%s: key has expired", __func__);
+            bpf_printk("bpf_wg_decrypt: key has expired");
             return false;
         case -EPROTO:
-            bpf_printk("%s: counter has expired", __func__);
+            bpf_printk("bpf_wg_decrypt: counter has expired");
             return false;
         default:
-            bpf_printk("%s: %d", __func__, ret);
+            bpf_printk("bpf_wg_decrypt: %d", ret);
             return false;
     }
 }

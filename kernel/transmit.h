@@ -14,7 +14,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#include "dsa.h"
+#include "dsa/dsa.h"
 
 
 __u32 bpf_xdp_checksum(struct xdp_md *xdp, __u32 offset,
@@ -40,6 +40,26 @@ __u32 push_l2_header(void *l2, struct packet_data *pkt, struct bpf_fib_lookup *f
             return push_mtk_header(l2, pkt, fib);
         default:
             return -1;
+    }
+}
+
+__always_inline static
+void restore_eth_header(struct packet_data *pkt, __u16 offset)
+{
+    memmove(pkt->data + offset, pkt->data, sizeof(struct ethhdr));
+}
+
+__always_inline static
+void restore_l2_header(struct packet_data *pkt, __u16 offset)
+{
+    if (!pkt->is_xdp)
+        return;
+
+    switch (config.dsa_proto) {
+        case DSA_PROTO_NONE:
+            return restore_eth_header(pkt, offset);
+        case DSA_PROTO_MTK:
+            return restore_mtk_header(pkt, offset);
     }
 }
 
@@ -165,7 +185,7 @@ bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
     udph->dest = tuple->ipv4.dport;
     udph->len = bpf_htons(udp_len);
 
-    if (config.udp_check) {
+    if (!config.udp_nocheck) {
         udph->check = udp_v4_checksum(pkt, iph_offset + sizeof(*ip4h), udp_len,
                                 ip4h->saddr, ip4h->daddr);
         if (!udph->check) {
@@ -227,7 +247,7 @@ bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family,
 __always_inline static
 int output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_len)
 {
-    struct ethhdr *ethh = pkt->data + offset;
+    void *ethh = pkt->data + offset;
     struct bpf_fib_lookup fib = {};
     long ret;
 
@@ -235,24 +255,24 @@ int output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_
     fib.family = family;
 
     if (family == AF_INET) {
-        struct iphdr *ip4h = (struct iphdr *)(ethh + 1);
+        struct iphdr *ip4h = (struct iphdr *)(ethh + eth_len);
         if ((void *)(ip4h + 1) > pkt->data_end)
             return -1;
 
         fib.ipv4_src = ip4h->saddr;
         fib.ipv4_dst = ip4h->daddr;
 
-        ethh->h_proto = bpf_htons(ETH_P_IP);
+        //ethh->h_proto = bpf_htons(ETH_P_IP);
     }
     else {
-        struct ipv6hdr *ip6h = (struct ipv6hdr *)(ethh + 1);
+        struct ipv6hdr *ip6h = (struct ipv6hdr *)(ethh + eth_len);
         if ((void *)(ip6h + 1) > pkt->data_end)
             return -1;
 
         ip6cpy(fib.ipv6_src, ip6h->saddr.in6_u.u6_addr32);
         ip6cpy(fib.ipv6_dst, ip6h->daddr.in6_u.u6_addr32);
 
-        ethh->h_proto = bpf_htons(ETH_P_IPV6);
+        //ethh->h_proto = bpf_htons(ETH_P_IPV6);
     }
 
     ret = bpf_fib_lookup(pkt->ctx, &fib, sizeof(fib), 0);
@@ -260,13 +280,13 @@ int output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_
         if (ret != BPF_FIB_LKUP_RET_NOT_FWDED)
             bpf_printk("%s: bpf_fib_lookup: %d", __func__, ret);
 
-        if (offset)
-            memmove(pkt->data + offset, pkt->data, 2 * ETH_ALEN);
+        /*if (offset)
+            memmove(pkt->data + offset, pkt->data, 2 * ETH_ALEN);*/
 
         return 0;
     }
 
-    return push_l2_header(ethh, pkt, &fib);
+    return push_l2_header(pkt->is_xdp ? ethh : pkt->data, pkt, &fib);
 }
 
 

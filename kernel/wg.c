@@ -16,7 +16,7 @@
 #include "wireguard.h"
 
 #include "conntrack.h"
-#include "rss.h"
+#include "rss/rss.h"
 
 
 __always_inline static
@@ -30,7 +30,7 @@ int wg_encrypt_path(struct packet_data *pkt, struct packet_header *header,
     if (config.conntrack) {
         if (!parse_l4_header(pkt, header->l3.proto, &header->l4) ||
                 !conntrack_lookup_from_header(pkt, &header->l3, &header->l4)) {
-            //bpf_printk("before");
+            bpf_printk("encrypt before");
             return WG_ACTION_PASS;
         }
     }
@@ -41,7 +41,7 @@ int wg_encrypt_path(struct packet_data *pkt, struct packet_header *header,
 
     if (config.conntrack) {
         if (!conntrack_lookup_from_tuple(pkt, &endpoint.tuple, endpoint.family, IPPROTO_UDP)) {
-            //bpf_printk("after");
+            bpf_printk("encrypt after");
             return WG_ACTION_PASS;
         }
     }
@@ -58,7 +58,7 @@ int wg_decrypt_path(struct packet_data *pkt, struct packet_header *header)
 {
     struct wg_decrypt_inner inner;
     enum wg_action action;
-    int out_ifindex;
+    int out_ifindex = 0;
 
     if (header->l3.proto != IPPROTO_UDP ||
             !parse_udp_header(pkt, &header->l4))
@@ -70,7 +70,7 @@ int wg_decrypt_path(struct packet_data *pkt, struct packet_header *header)
 
     if (config.conntrack) {
         if (!conntrack_lookup_from_header(pkt, &header->l3, &header->l4)) {
-            //bpf_printk("before");
+            bpf_printk("decrypt before");
             return WG_ACTION_PASS;
         }
     }
@@ -82,16 +82,17 @@ int wg_decrypt_path(struct packet_data *pkt, struct packet_header *header)
     if (config.conntrack) {
         if (!parse_l4_header(pkt, inner.l3.proto, &inner.l4) ||
                 !conntrack_lookup_from_header(pkt, &inner.l3, &inner.l4)) {
-            //bpf_printk("after");
-            if (pkt->is_xdp)
-                memmove(pkt->data + inner.header_len, pkt->data, 2 * ETH_ALEN + 2);
+            bpf_printk("decrypt after");
+            restore_l2_header(pkt, inner.header_len);
             goto bpf_adjust_packet;
         }
     }
 
-    out_ifindex = output(pkt, inner.l3.family, pkt->is_xdp ? inner.header_len : 0, header->l3.offset);
-    if (out_ifindex <= 0)
+    out_ifindex = output(pkt, inner.l3.family, inner.header_len, header->l3.offset);
+    if (out_ifindex <= 0) {
         bpf_printk("%s: out = %d", __func__, out_ifindex);
+        restore_l2_header(pkt, inner.header_len);
+    }
 
 bpf_adjust_packet:
     if (!bpf_adjust_packet(pkt, -inner.header_len, -inner.trailer_len, inner.l3.family))
@@ -177,6 +178,11 @@ int xdp_wg_cpumap(struct xdp_md *xdp)
 SEC("tc")
 int tc_wg(struct __sk_buff *skb)
 {
+    if (skb->gso_size) {
+        bpf_printk("GSO isn't supported");
+        return TC_ACT_UNSPEC;
+    }
+
     return __tc_wg(skb);
 }
 

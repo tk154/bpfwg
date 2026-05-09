@@ -61,16 +61,16 @@ int bpf_wg_decrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
         case 0:
             return true;
         case -ENOKEY:
-            bpf_printk("%s: key not available", __func__);
+            bpf_printk("bpf_wg_decrypt: key not available");
             return false;
         case -EKEYEXPIRED:
-            bpf_printk("%s: key has expired", __func__);
+            bpf_printk("bpf_wg_decrypt: key has expired");
             return false;
         case -EPROTO:
-            bpf_printk("%s: counter is invalid", __func__);
+            bpf_printk("bpf_wg_decrypt: counter is invalid");
             return false;
         default:
-            bpf_printk("%s: %d", __func__, ret);
+            bpf_printk("bpf_wg_decrypt: %d", ret);
             return false;
     }
 }

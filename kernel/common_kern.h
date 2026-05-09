@@ -7,7 +7,7 @@
 #include <bpf/bpf_endian.h>
 #include <sys/socket.h>
 
-#include "../../common.h"
+#include "../common.h"
 
 #define MAX_MTU 9000
 
@@ -113,21 +113,21 @@ bool bpf_skb_adjust_packet(struct packet_data *pkt, __s32 head, __s32 tail, sa_f
 
     if (head > 0) {
         flags = family == AF_INET ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV6;
-        flags &= BPF_F_ADJ_ROOM_ENCAP_L4_UDP;
+        flags |= BPF_F_ADJ_ROOM_ENCAP_L4_UDP;
     }
     else {
         flags = family == AF_INET ? BPF_F_ADJ_ROOM_DECAP_L3_IPV4 : BPF_F_ADJ_ROOM_DECAP_L3_IPV6;
     }
 
-    ret = bpf_skb_adjust_room(skb, head, BPF_ADJ_ROOM_MAC, flags /*| BPF_F_ADJ_ROOM_FIXED_GSO*/);
-    if (ret) {
-        bpf_printk("bpf_skb_adjust_room: %d", ret);
-        return false;
-    }
-
     ret = bpf_skb_change_tail(skb, skb->len + tail, 0);
     if (ret) {
         bpf_printk("bpf_skb_change_tail: %d", ret);
+        return false;
+    }
+
+    ret = bpf_skb_adjust_room(skb, head, BPF_ADJ_ROOM_MAC, flags /*| BPF_F_ADJ_ROOM_FIXED_GSO*/);
+    if (ret) {
+        bpf_printk("bpf_skb_adjust_room: %d", ret);
         return false;
     }
 
