@@ -12,9 +12,15 @@ static void empty_signal_handler(int signal) {}
 int main(int argc, char *argv[]) {
     struct bpf_handle *bpf;
     int ret = EXIT_FAILURE;
+    int rc;
     struct cmd_args args = { 0 };
 
-    if (check_cmd_args(argc, argv, &args) != BPFWG_RC_OK)
+    rc = check_cmd_args(argc, argv, &args);
+    if (rc == BPFWG_RC_HELP) {
+        ret = EXIT_SUCCESS;
+        goto out;
+    }
+    if (rc != BPFWG_RC_OK)
         goto out;
 
     bpfwg_info("Init BPF object and setting config ...\n");

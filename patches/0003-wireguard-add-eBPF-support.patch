@@ -1,0 +1,641 @@
+From 396acbc1c494fbc72699e90f64895c60d20c204a Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Tue, 14 Apr 2026 13:38:16 +0200
+Subject: [PATCH 3/3] wireguard: add eBPF support
+
+---
+ drivers/net/wireguard/Makefile     |   7 +
+ drivers/net/wireguard/allowedips.c |  11 +
+ drivers/net/wireguard/allowedips.h |   2 +
+ drivers/net/wireguard/bpf.c        | 372 +++++++++++++++++++++++++++++
+ drivers/net/wireguard/bpf.h        |  18 ++
+ drivers/net/wireguard/device.c     |  38 +++
+ drivers/net/wireguard/device.h     |   6 +
+ drivers/net/wireguard/main.c       |   7 +
+ drivers/net/wireguard/netlink.c    |   2 +-
+ drivers/net/wireguard/noise.h      |   6 +
+ drivers/net/wireguard/receive.c    |  10 +
+ drivers/net/wireguard/send.c       |   5 +
+ 12 files changed, 483 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/wireguard/bpf.c
+ create mode 100644 drivers/net/wireguard/bpf.h
+
+diff --git a/drivers/net/wireguard/Makefile b/drivers/net/wireguard/Makefile
+index dbe1f8514efc..9b27f61ef5e1 100644
+--- a/drivers/net/wireguard/Makefile
++++ b/drivers/net/wireguard/Makefile
+@@ -14,4 +14,11 @@ wireguard-y += allowedips.o
+ wireguard-y += ratelimiter.o
+ wireguard-y += cookie.o
+ wireguard-y += netlink.o
++
++ifeq ($(CONFIG_WIREGUARD),m)
++wireguard-$(CONFIG_DEBUG_INFO_BTF_MODULES) += bpf.o
++else ifeq ($(CONFIG_WIREGUARD),y)
++wireguard-$(CONFIG_DEBUG_INFO_BTF) += bpf.o
++endif
++
+ obj-$(CONFIG_WIREGUARD) := wireguard.o
+diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
+index 4b8528206cc8..b969771aaa6d 100644
+--- a/drivers/net/wireguard/allowedips.c
++++ b/drivers/net/wireguard/allowedips.c
+@@ -374,6 +374,17 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 	return NULL;
+ }
+ 
++/* Returns a strong reference to a peer */
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len)
++{
++	if (addr_len == 4)
++		return lookup(table->root4, 32, addr);
++	else if (addr_len == 16)
++		return lookup(table->root6, 128, addr);
++	return NULL;
++}
++
+ int __init wg_allowedips_slab_init(void)
+ {
+ 	node_cache = KMEM_CACHE(allowedips_node, 0);
+diff --git a/drivers/net/wireguard/allowedips.h b/drivers/net/wireguard/allowedips.h
+index 2346c797eb4d..e768e1801f64 100644
+--- a/drivers/net/wireguard/allowedips.h
++++ b/drivers/net/wireguard/allowedips.h
+@@ -48,6 +48,8 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
+ 					 struct sk_buff *skb);
+ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 					 struct sk_buff *skb);
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len);
+ 
+ #ifdef DEBUG
+ bool wg_allowedips_selftest(void);
+diff --git a/drivers/net/wireguard/bpf.c b/drivers/net/wireguard/bpf.c
+new file mode 100644
+index 000000000000..3f4f9d4d4c56
+--- /dev/null
++++ b/drivers/net/wireguard/bpf.c
+@@ -0,0 +1,372 @@
++#include <linux/btf.h>
++#include <linux/filter.h>
++#include <linux/netdevice.h>
++#include <net/xdp.h>
++
++#include "bpf.h"
++#include "peer.h"
++#include "queueing.h"
++#include "timers.h"
++
++
++/*BTF_ID_LIST(btf_wg_ids)
++BTF_ID(struct, wg_device)
++BTF_ID(struct, wg_peer)*/
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc struct wg_device *
++bpf_xdp_wg_device_get_by_index(struct xdp_md *xdp_ctx, u32 ifindex)
++{
++	struct xdp_buff *ctx = (struct xdp_buff *)xdp_ctx;
++	struct net *caller_net = dev_net(ctx->rxq->dev);
++
++	return wg_device_get_by_index(caller_net, ifindex);
++}
++
++__bpf_kfunc struct wg_device *
++bpf_xdp_wg_device_get_by_port(struct xdp_md *xdp_ctx, u16 port)
++{
++	struct xdp_buff *ctx = (struct xdp_buff *)xdp_ctx;
++	struct net *caller_net = dev_net(ctx->rxq->dev);
++
++	return wg_device_get_by_port(caller_net, port);
++}
++
++__bpf_kfunc struct wg_device *
++bpf_skb_wg_device_get_by_index(struct __sk_buff *skb_ctx, u32 ifindex)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct net *caller_net;
++
++	caller_net = skb->dev ? dev_net(skb->dev) : sock_net(skb->sk);
++	return wg_device_get_by_index(caller_net, ifindex);
++}
++
++__bpf_kfunc struct wg_device *
++bpf_skb_wg_device_get_by_port(struct __sk_buff *skb_ctx, u16 port)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct net *caller_net;
++
++	caller_net = skb->dev ? dev_net(skb->dev) : sock_net(skb->sk);
++	return wg_device_get_by_port(caller_net, port);
++}
++
++__bpf_kfunc struct wg_peer *
++bpf_wg_peer_hashtable_lookup(struct wg_device *wg, __le32 idx)
++{
++	struct wg_peer *peer = NULL;
++
++	wg_index_hashtable_lookup(wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx, &peer);
++	if (likely(peer && !READ_ONCE(peer->is_dead)))
++		return peer;
++
++	wg_peer_put(peer);
++	return NULL;
++}
++
++__bpf_kfunc struct wg_peer *
++bpf_wg_peer_allowedips_lookup(struct wg_device *wg, const void *addr, u32 addr__sz)
++{
++	struct wg_peer *peer;
++
++	peer = wg_allowedips_lookup_bpf(&wg->peer_allowedips, addr, addr__sz);
++	if (likely(peer && !READ_ONCE(peer->is_dead)))
++		return peer;
++
++	wg_peer_put(peer);
++	return NULL;
++}
++
++__bpf_kfunc int
++bpf_wg_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple, u32 tuple__ksz)
++{
++	u16 sport = htons(peer->device->incoming_port);
++	struct endpoint *endpoint = &peer->endpoint;
++	int ret;
++
++	if (unlikely(tuple__ksz != sizeof(*tuple)))
++		return -EINVAL;
++
++	read_lock_bh(&peer->endpoint_lock);
++	switch (endpoint->addr.sa_family) {
++		case AF_INET:
++			tuple->ipv4.daddr = endpoint->addr4.sin_addr.s_addr;
++			tuple->ipv4.dport = endpoint->addr4.sin_port;
++			tuple->ipv4.saddr = endpoint->src4.s_addr;
++			tuple->ipv4.sport = sport;
++			ret = AF_INET;
++			break;
++
++		case AF_INET6:
++			memcpy(tuple->ipv6.daddr, &endpoint->addr6.sin6_addr, sizeof(tuple->ipv6.daddr));
++			memcpy(tuple->ipv6.saddr, &endpoint->src6, sizeof(tuple->ipv6.saddr));
++			tuple->ipv6.dport = endpoint->addr6.sin6_port;
++			tuple->ipv6.sport = sport;
++			ret = AF_INET6;
++			break;
++
++		default:
++			ret = -EAFNOSUPPORT;
++	}
++	read_unlock_bh(&peer->endpoint_lock);
++
++	return ret;
++}
++
++static int
++bpf_wg_encrypt(void *data, struct scatterlist *sg, u32 length, struct wg_peer *peer)
++{
++	struct message_data *header = (struct message_data *)data;
++	size_t plaintext_len = length - message_data_len(0);
++	struct noise_keypair *keypair;
++	int ret = 0;
++	u64 nonce;
++
++	if (unlikely(/*length < message_data_len(MESSAGE_PADDING_MULTIPLE) ||*/
++			length != ALIGN(length, MESSAGE_PADDING_MULTIPLE)))
++		return -EINVAL;
++
++	rcu_read_lock_bh();
++	keypair = wg_noise_keypair_get(
++		rcu_dereference_bh(peer->keypairs.current_keypair));
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair || !READ_ONCE(keypair->sending.is_valid))) {
++		ret = -ENOKEY;
++		goto no_key;
++	}
++
++	if (unlikely(wg_birthdate_has_expired(keypair->sending.birthdate, REJECT_AFTER_TIME))) {
++		ret = -EKEYEXPIRED;
++		goto key_expired;
++	}
++
++	nonce = atomic64_inc_return(&keypair->sending_counter) - 1;
++	if (unlikely(nonce >= REJECT_AFTER_MESSAGES)) {
++		ret = -EPROTO;
++		goto key_expired;
++	}
++
++	if (unlikely(!chacha20poly1305_encrypt_sg_inplace(sg, plaintext_len,
++			NULL, 0, nonce, keypair->sending.key))) {
++		ret = -EBADMSG;
++		goto out;
++	}
++
++	header->header.type = cpu_to_le32(MESSAGE_DATA);
++	header->key_idx = keypair->remote_index;
++	header->counter = cpu_to_le64(nonce);
++
++	wg_noise_send_keep_key_fresh(peer);
++	goto out;
++
++key_expired:
++	WRITE_ONCE(keypair->sending.is_valid, false);
++no_key:
++	wg_packet_send_queued_handshake_initiation(peer, false);
++out:
++	wg_noise_keypair_put(keypair, false);
++	return ret;
++}
++
++static int
++bpf_wg_decrypt(void *data, struct scatterlist *sg, u32 length, struct wg_peer *peer)
++{
++	struct message_data *header = (struct message_data *)data;
++	size_t encrypted_len = length - sizeof(*header);
++	struct noise_keypair *keypair;
++	int ret = 0;
++	u64 nonce;
++
++	if (unlikely(length < message_data_len(MESSAGE_PADDING_MULTIPLE) /*||
++			length != ALIGN(length, MESSAGE_PADDING_MULTIPLE)*/))
++		return -EINVAL;
++
++	rcu_read_lock_bh();
++	keypair = wg_noise_keypair_get(
++		rcu_dereference_bh(peer->keypairs.current_keypair));
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair || !READ_ONCE(keypair->receiving.is_valid))) {
++		ret = -ENOKEY;
++		goto out;
++	}
++
++	if (unlikely(wg_birthdate_has_expired(keypair->receiving.birthdate, REJECT_AFTER_TIME) ||
++		  READ_ONCE(keypair->receiving_counter.counter) >= REJECT_AFTER_MESSAGES)) {
++		ret = -EKEYEXPIRED;
++		goto key_expired;
++	}
++
++	nonce = le64_to_cpu(header->counter);
++
++	if (unlikely(!chacha20poly1305_decrypt_sg_inplace(sg, encrypted_len,
++			NULL, 0, nonce, keypair->receiving.key))) {
++		ret = -EBADMSG;
++		goto out;
++	}
++
++	if (unlikely(!wg_noise_counter_validate(&keypair->receiving_counter, nonce))) {
++		ret = -EPROTO;
++		goto out;
++	}
++
++	/*if (unlikely(wg_noise_received_with_keypair(&peer->keypairs, keypair))) {
++		wg_timers_handshake_complete(peer);
++		wg_packet_send_staged_packets(peer);
++	}*/
++
++	wg_noise_receive_keep_key_fresh(peer);
++	goto out;
++
++key_expired:
++	WRITE_ONCE(keypair->receiving.is_valid, false);
++out:
++	wg_noise_keypair_put(keypair, false);
++	return ret;
++}
++
++__bpf_kfunc int
++bpf_xdp_wg_encrypt(struct xdp_md *xdp_ctx, u32 offset, u32 length,
++				   struct wg_peer *peer)
++{
++	struct xdp_buff *xdp = (struct xdp_buff *)xdp_ctx;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct skb_shared_info *sinfo;
++	unsigned int nr_frags;
++
++	if (unlikely(offset > 0xffff || length > 0xffff))
++		return -EFAULT;
++
++	if (unlikely(offset + length > xdp_get_buff_len(xdp)))
++		return -EINVAL;
++
++	sinfo = xdp_get_shared_info_from_buff(xdp);
++	nr_frags = unlikely(xdp_buff_has_frags(xdp)) ? sinfo->nr_frags : 0;
++	sg_init_table(sg, nr_frags + 1);
++
++	bpf_xdp_to_sgvec(xdp, sg, offset + sizeof(struct message_data),
++		length - sizeof(struct message_data));
++
++	return bpf_wg_encrypt(xdp->data + offset, sg, length, peer);
++}
++
++__bpf_kfunc int
++bpf_xdp_wg_decrypt(struct xdp_md *xdp_ctx, u32 offset, u32 length,
++				   struct wg_peer *peer)
++{
++	struct xdp_buff *xdp = (struct xdp_buff *)xdp_ctx;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct skb_shared_info *sinfo;
++	unsigned int nr_frags;
++
++	if (unlikely(offset > 0xffff || length > 0xffff))
++		return -EFAULT;
++
++	if (unlikely(offset + length > xdp_get_buff_len(xdp)))
++		return -EINVAL;
++
++	sinfo = xdp_get_shared_info_from_buff(xdp);
++	nr_frags = unlikely(xdp_buff_has_frags(xdp)) ? sinfo->nr_frags : 0;
++	sg_init_table(sg, nr_frags + 1);
++
++	bpf_xdp_to_sgvec(xdp, sg, offset + sizeof(struct message_data),
++		length - sizeof(struct message_data));
++
++	return bpf_wg_decrypt(xdp->data + offset, sg, length, peer);
++}
++
++__bpf_kfunc int
++bpf_skb_wg_encrypt(struct __sk_buff *skb_ctx, u32 offset, u32 length,
++				   struct wg_peer *peer)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct skb_shared_info *sinfo;
++
++	if (unlikely(offset > 0xffff || length > 0xffff))
++		return -EFAULT;
++
++	if (unlikely(offset + length > skb->len))
++		return -EINVAL;
++
++	sinfo = skb_shinfo(skb);
++	sg_init_table(sg, sinfo->nr_frags + 1);
++
++	if (skb_to_sgvec(skb, sg, offset + sizeof(struct message_data),
++			length - sizeof(struct message_data)) <= 0)
++		return -EMSGSIZE;
++
++	return bpf_wg_encrypt(skb->data + offset, sg, length, peer);
++}
++
++__bpf_kfunc int
++bpf_skb_wg_decrypt(struct __sk_buff *skb_ctx, u32 offset, u32 length,
++				   struct wg_peer *peer)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct skb_shared_info *sinfo;
++
++	if (unlikely(offset > 0xffff || length > 0xffff))
++		return -EFAULT;
++
++	if (unlikely(offset + length > skb->len))
++		return -EINVAL;
++
++	sinfo = skb_shinfo(skb);
++	sg_init_table(sg, sinfo->nr_frags + 1);
++
++	if (skb_to_sgvec(skb, sg, offset + sizeof(struct message_data),
++			length - sizeof(struct message_data)) <= 0)
++		return -EMSGSIZE;
++
++	return bpf_wg_decrypt(skb->data + offset, sg, length, peer);
++}
++
++__bpf_kfunc void
++bpf_wg_device_put(struct wg_device *wg)
++{
++	dev_put(wg->dev);
++}
++
++__bpf_kfunc void
++bpf_wg_peer_put(struct wg_peer *peer)
++{
++	wg_peer_put(peer);
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(wg_kfunc_set)
++BTF_ID_FLAGS(func, bpf_xdp_wg_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_xdp_wg_device_get_by_port, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_skb_wg_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_skb_wg_device_get_by_port, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_wg_peer_hashtable_lookup, KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_peer_allowedips_lookup, KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_endpoint_tuple_get, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_xdp_wg_encrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_xdp_wg_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_skb_wg_encrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_skb_wg_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_device_put, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_wg_peer_put, KF_RELEASE)
++BTF_KFUNCS_END(wg_kfunc_set)
++
++static const struct btf_kfunc_id_set wireguard_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set   = &wg_kfunc_set,
++};
++
++int register_wireguard_bpf(void)
++{
++	int ret;
++
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &wireguard_kfunc_set);
++	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &wireguard_kfunc_set);
++
++	return ret;
++}
+diff --git a/drivers/net/wireguard/bpf.h b/drivers/net/wireguard/bpf.h
+new file mode 100644
+index 000000000000..cc9599a01e70
+--- /dev/null
++++ b/drivers/net/wireguard/bpf.h
+@@ -0,0 +1,18 @@
++#ifndef _WG_BPF_H
++#define _WG_BPF_H
++
++#if (IS_BUILTIN(CONFIG_WIREGUARD) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
++    (IS_MODULE(CONFIG_WIREGUARD) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
++
++extern int register_wireguard_bpf(void);
++
++#else
++
++static inline int register_wireguard_bpf(void)
++{
++	return 0;
++}
++
++#endif
++
++#endif /* _WG_BPF_H */
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index acb9ce7a626a..bd76fdd7bac5 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -471,3 +471,41 @@ void wg_device_uninit(void)
+ 	unregister_pm_notifier(&pm_notifier);
+ 	rcu_barrier();
+ }
++
++struct wg_device *
++wg_device_get_by_index(struct net *net, int ifindex)
++{
++	struct wg_device *wg;
++
++	rcu_read_lock();
++	list_for_each_entry(wg, &device_list, device_list) {
++		if (rcu_access_pointer(wg->creating_net) == net &&
++				wg->dev->ifindex == ifindex) {
++			dev_hold(wg->dev);
++			rcu_read_unlock();
++			return wg;
++		}
++	}
++	rcu_read_unlock();
++
++	return NULL;
++}
++
++struct wg_device *
++wg_device_get_by_port(struct net *net, u16 port)
++{
++	struct wg_device *wg;
++
++	rcu_read_lock();
++	list_for_each_entry(wg, &device_list, device_list) {
++		if (rcu_access_pointer(wg->creating_net) == net &&
++				wg->incoming_port == port) {
++			dev_hold(wg->dev);
++			rcu_read_unlock();
++			return wg;
++		}
++	}
++	rcu_read_unlock();
++
++	return NULL;
++}
+diff --git a/drivers/net/wireguard/device.h b/drivers/net/wireguard/device.h
+index 43c7cebbf50b..26e9d842ae20 100644
+--- a/drivers/net/wireguard/device.h
++++ b/drivers/net/wireguard/device.h
+@@ -59,4 +59,10 @@ struct wg_device {
+ int wg_device_init(void);
+ void wg_device_uninit(void);
+ 
++struct wg_device *
++wg_device_get_by_index(struct net *net, int ifindex);
++
++struct wg_device *
++wg_device_get_by_port(struct net *net, u16 port);
++
+ #endif /* _WG_DEVICE_H */
+diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
+index a00671b58701..639fff975a12 100644
+--- a/drivers/net/wireguard/main.c
++++ b/drivers/net/wireguard/main.c
+@@ -9,6 +9,7 @@
+ #include "queueing.h"
+ #include "ratelimiter.h"
+ #include "netlink.h"
++#include "bpf.h"
+ 
+ #include <uapi/linux/wireguard.h>
+ 
+@@ -45,11 +46,17 @@ static int __init wg_mod_init(void)
+ 	if (ret < 0)
+ 		goto err_netlink;
+ 
++	ret = register_wireguard_bpf();
++	if (ret < 0)
++		goto err_bpf;
++
+ 	pr_info("WireGuard " WIREGUARD_VERSION " loaded. See www.wireguard.com for information.\n");
+ 	pr_info("Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.\n");
+ 
+ 	return 0;
+ 
++err_bpf:
++	wg_genetlink_uninit();
+ err_netlink:
+ 	wg_device_uninit();
+ err_device:
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index f7055180ba4a..b04ce45aec1f 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -638,7 +638,7 @@ int __init wg_genetlink_init(void)
+ 	return genl_register_family(&genl_family);
+ }
+ 
+-void __exit wg_genetlink_uninit(void)
++void wg_genetlink_uninit(void)
+ {
+ 	genl_unregister_family(&genl_family);
+ }
+diff --git a/drivers/net/wireguard/noise.h b/drivers/net/wireguard/noise.h
+index c527253dba80..89485c87862a 100644
+--- a/drivers/net/wireguard/noise.h
++++ b/drivers/net/wireguard/noise.h
+@@ -132,4 +132,10 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
+ bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
+ 				      struct noise_keypairs *keypairs);
+ 
++bool wg_noise_counter_validate(struct noise_replay_counter *counter,
++					u64 their_counter);
++
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer);
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer);
++
+ #endif /* _WG_NOISE_H */
+diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
+index eb8851113654..849f7cf1d293 100644
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -239,6 +239,11 @@ static void keep_key_fresh(struct wg_peer *peer)
+ 	}
+ }
+ 
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer)
++{
++	keep_key_fresh(peer);
++}
++
+ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ {
+ 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
+@@ -330,6 +335,11 @@ static bool counter_validate(struct noise_replay_counter *counter, u64 their_cou
+ 	return ret;
+ }
+ 
++bool wg_noise_counter_validate(struct noise_replay_counter *counter, u64 their_counter)
++{
++	return counter_validate(counter, their_counter);
++}
++
+ #include "selftest/counter.c"
+ 
+ static void wg_packet_consume_data_done(struct wg_peer *peer,
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+index 26e09c30d596..0ac5e452368e 100644
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -138,6 +138,11 @@ static void keep_key_fresh(struct wg_peer *peer)
+ 		wg_packet_send_queued_handshake_initiation(peer, false);
+ }
+ 
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer)
++{
++	keep_key_fresh(peer);
++}
++
+ static unsigned int calculate_skb_padding(struct sk_buff *skb)
+ {
+ 	unsigned int padded_size, last_unit = skb->len;
+-- 
+2.53.0
+

@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,21 +18,39 @@
     #define DEFAULT_BPF_OBJECT_PATH    "./wg_be.o"
 #endif
 
-static void print_usage(char* prog) {
-    bpfwg_error("Usage: %s <hook> [network_interface(s)...] [options]\n\n", prog);
+static void print_usage(const char *prog, FILE *out) {
+    fprintf(out, "Usage: %s [options] <hook> <network_interface> [network_interface...]\n\n", prog);
+    fprintf(out, "Attach the WireGuard eBPF data path to TC ingress or XDP.\n\n");
 
-    bpfwg_error("Options:\n");
-    bpfwg_error("  -l, --log-level      Log level, can be error, warning, info, debug, verbose (Default: info).\n");
-    bpfwg_error("  -e  --exclude-cpus CPU[,CPU-RANGE...]  Exclude CPUs from RSS selection, e.g. 0,1,4-7.\n");
+    fprintf(out, "Hooks:\n");
+    fprintf(out, "  tc                 Attach the TC ingress program.\n");
+    fprintf(out, "  xdp                Attach the XDP program with automatic mode selection.\n");
+    fprintf(out, "  xdpgeneric         Attach XDP in generic/SKB mode.\n");
+    fprintf(out, "  xdpnative          Attach XDP in native/driver mode.\n");
+    fprintf(out, "  xdpoffload         Attach XDP in hardware offload mode.\n\n");
 
-    bpfwg_error("All possible hooks to attach the BPF program are listed below:\n");
-    bpfwg_error("  tc            TC hoook\n");
-    bpfwg_error("  xdp           XDP hook\n");
-    bpfwg_error("  xdpgeneric    Generic/SKB XDP hook\n");
-    bpfwg_error("  xdpnative     Native/Driver XDP hook\n");
-    bpfwg_error("  xdpoffload    XDP offloaded into hardware\n");
+    fprintf(out, "Options:\n");
+    fprintf(out, "  -?, -h, --help                 Show this help text and exit.\n");
+    fprintf(out, "  -c, --conntrack                Require conntrack entries before redirecting packets.\n");
+    fprintf(out, "  -d, --dsa PROTO                Enable DSA handling. Supported values: mtk.\n");
+    fprintf(out, "  -e, --exclude-cpus LIST        Exclude CPUs from RSS targets, e.g. 0,1,4-7.\n");
+    fprintf(out, "  -l, --log-level LEVEL          Set log level: error, warning, info, debug, verbose.\n");
+    fprintf(out, "                                  Default: info.\n");
+    fprintf(out, "  -o, --object PATH              BPF object file to load. Default: %s.\n", DEFAULT_BPF_OBJECT_PATH);
+    fprintf(out, "  -r, --rss PROGRAM              Enable XDP cpumap RSS with the selected program.\n");
+    fprintf(out, "                                  Common values: round_robin, match_port,\n");
+    fprintf(out, "                                  tuple_steering, rx_hash.\n");
+    fprintf(out, "  -u, --udp                      Disable IPv4 UDP tunnel checksum calculation.\n\n");
+
+    fprintf(out, "Examples:\n");
+    fprintf(out, "  %s tc eth0 -o src/kernel/obj/wg_le.o\n", prog);
+    fprintf(out, "  %s xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0\n", prog);
+    fprintf(out, "  %s xdp eth0 -o src/kernel/obj/wg_le.o -d mtk --conntrack --udp\n", prog);
 }
 
+static bool is_help_arg(const char *arg) {
+    return !strcmp(arg, "-?") || !strcmp(arg, "-h") || !strcmp(arg, "--help");
+}
 
 static enum bpf_hook parse_hook(char* prog_hook) {
     size_t arg_len;
@@ -172,13 +191,15 @@ invalid:
 }
 
 // Checks if the given arguments are valid and determines the BPF hook
-static bool parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
+static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     int opt, opt_index;
+    int i;
 
     struct option options[] = {
         { "conntrack",    no_argument,       0, 'c' },
         { "dsa",          required_argument, 0, 'd' },
         { "exclude-cpus", required_argument, 0, 'e' },
+        { "help",         no_argument,       0, 'h' },
         { "log-level",    required_argument, 0, 'l' },
         { "object",       required_argument, 0, 'o' },
         { "rss",          required_argument, 0, 'r' },
@@ -186,7 +207,14 @@ static bool parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
         { 0,              0,                 0,  0  }
     };
 
-    while ((opt = getopt_long(argc, argv, "cd:e:l:o:r:u", options, &opt_index)) != -1) {
+    for (i = 1; i < argc; i++) {
+        if (is_help_arg(argv[i])) {
+            print_usage(argv[0], stdout);
+            return BPFWG_RC_HELP;
+        }
+    }
+
+    while ((opt = getopt_long(argc, argv, "cd:e:hl:o:r:u?", options, &opt_index)) != -1) {
         switch (opt) {
             case 'c':
                 args->config.conntrack = true;
@@ -195,17 +223,21 @@ static bool parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
             case 'd':
                 args->config.dsa_proto = parse_dsa_proto(optarg);
                 if (args->config.dsa_proto == DSA_PROTO_NONE)
-                    return false;
+                    return BPFWG_RC_ERR;
             break;
 
             case 'e':
                 if (!parse_cpu_list(optarg, &args->rss_excluded_cpus))
-                    return false;
+                    return BPFWG_RC_ERR;
             break;
+
+            case 'h':
+                print_usage(argv[0], stdout);
+                return BPFWG_RC_HELP;
 
             case 'l':
                 if (!parse_log_level(optarg))
-                    return false;
+                    return BPFWG_RC_ERR;
             break;
 
             case 'o':
@@ -221,25 +253,22 @@ static bool parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
             break;
 
             case '?':
-                return false;
+                return BPFWG_RC_ERR;
         }
     }
 
-    // Check if the hook is provided in the command line
-    if (argc - optind < 2) {
+    if (argc - optind < 1) {
         bpfwg_error("Missing hook argument.\n\n");
-        return false;
+        return BPFWG_RC_ERR;
     }
 
-    // Check the hook argument
     args->hook = parse_hook(argv[optind]);
     if (!args->hook)
-        return false;
+        return BPFWG_RC_ERR;
 
-    // Check if network interface(s) are provided in the command line
-    if (argc - optind < 1) {
+    if (argc - optind < 2) {
         bpfwg_error("Missing network interface(s).\n\n");
-        return false;
+        return BPFWG_RC_ERR;
     }
 
     args->ifaces = &argv[optind + 1];
@@ -247,13 +276,15 @@ static bool parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
 
     if (args->rss_excluded_cpus.count && !args->rss_prog_name) {
         bpfwg_error("--exclude-cpus requires --rss.\n\n");
-        return false;
+        return BPFWG_RC_ERR;
     }
 
-    return true;
+    return BPFWG_RC_OK;
 }
 
 int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
+    int rc;
+
     args->hook = BPF_HOOK_AUTO;
 
     args->bpf_obj_path = DEFAULT_BPF_OBJECT_PATH;
@@ -265,13 +296,11 @@ int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     args->config.conntrack = false;
     args->config.udp_nocheck = false;
 
-    // Check if the arguments are provided correctly
-    if (!parse_cmd_args(argc, argv, args)) {
-        print_usage(argv[0]);
-        return BPFWG_RC_ERR;
-    }
+    rc = parse_cmd_args(argc, argv, args);
+    if (rc == BPFWG_RC_ERR)
+        print_usage(argv[0], stderr);
 
-    return BPFWG_RC_OK;
+    return rc;
 }
 
 void free_cmd_args(struct cmd_args *args) {
