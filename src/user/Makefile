@@ -1,5 +1,5 @@
 CC 	   := gcc
-LDLIBS := -lbpf -lelf -lz
+LDLIBS := -lbpf -lelf -lz -lmnl
 
 SRC_DIR  := .
 BIN_DIR  := bin

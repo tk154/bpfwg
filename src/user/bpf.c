@@ -32,6 +32,8 @@ struct bpf_handle {
     __u32 *allowed_cpus;
     __u32 allowed_cpu_count;
 
+    struct bpfwg_dsa dsa_config;
+
     const char *obj_path;
     
     /* BPF program file descriptors */
@@ -40,6 +42,7 @@ struct bpf_handle {
     int tc_prog_fd;
 
     __u32 cpu_count;
+    bool dsa_enabled;
     bool rss_enabled;
     bool rss_prepared;
     bool obj_loaded;
@@ -112,6 +115,17 @@ static void *bpf_get_section_data(struct bpf_object *obj, const char *sec_name, 
     }
 
     return section_data;
+}
+
+static int bpf_set_dsa_config_obj(struct bpf_object *obj, const struct bpfwg_dsa *cfg) {
+    struct bpfwg_dsa *dsa;
+
+    dsa = bpf_get_section_data(obj, BPFWG_DSA_SECTION, sizeof(*dsa));
+    if (!dsa)
+        return BPFWG_RC_ERR;
+
+    memcpy(dsa, cfg, sizeof(*dsa));
+    return BPFWG_RC_OK;
 }
 
 static void bpf_object_close(struct bpf_object *obj) {
@@ -748,6 +762,19 @@ int bpf_set_config(struct bpf_handle *bpf, struct bpfwg_config *cfg) {
     return BPFWG_RC_OK;
 }
 
+int bpf_set_dsa_config(struct bpf_handle *bpf, const struct bpfwg_dsa *cfg) {
+    if (bpf->obj_loaded) {
+        bpfwg_error("DSA config must be set before loading the BPF object.
+");
+        return BPFWG_RC_ERR;
+    }
+
+    memcpy(&bpf->dsa_config, cfg, sizeof(bpf->dsa_config));
+    bpf->dsa_enabled = true;
+
+    return bpf_set_dsa_config_obj(bpf->obj, cfg);
+}
+
 struct bpf_handle* bpf_init(const char *obj_path) {
     struct bpf_handle *bpf;
 
@@ -768,6 +795,8 @@ struct bpf_handle* bpf_init(const char *obj_path) {
     bpf->excluded_cpus.count = 0;
     bpf->allowed_cpus = NULL;
     bpf->allowed_cpu_count = 0;
+    memset(&bpf->dsa_config, 0, sizeof(bpf->dsa_config));
+    bpf->dsa_enabled = false;
     bpf->rss_enabled = false;
     bpf->rss_prepared = false;
 

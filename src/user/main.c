@@ -4,6 +4,7 @@
 
 #include "args.h"
 #include "bpf.h"
+#include "dsa.h"
 #include "log.h"
 
 
@@ -11,6 +12,10 @@ static void empty_signal_handler(int signal) {}
 
 int main(int argc, char *argv[]) {
     struct bpf_handle *bpf;
+    struct bpfwg_dsa_attach dsa_attach = {};
+    char **attach_ifaces;
+    unsigned int attach_ifaces_count;
+    bool dsa_enabled = false;
     int ret = EXIT_FAILURE;
     int rc;
     struct cmd_args args = { 0 };
@@ -23,12 +28,27 @@ int main(int argc, char *argv[]) {
     if (rc != BPFWG_RC_OK)
         goto out;
 
+    attach_ifaces = args.ifaces;
+    attach_ifaces_count = args.ifaces_count;
+
+    if (bpfwg_dsa_prepare(args.ifaces, args.ifaces_count, args.dsa,
+            &args.dsa_config, &dsa_attach, &dsa_enabled) != BPFWG_RC_OK)
+        goto out;
+
+    if (dsa_enabled) {
+        attach_ifaces = dsa_attach.ifaces;
+        attach_ifaces_count = dsa_attach.ifaces_count;
+    }
+
     bpfwg_info("Init BPF object and setting config ...\n");
 
     // Load the BPF object (including program and maps) into the kernel
     bpf = bpf_init(args.bpf_obj_path);
     if (!bpf)
         goto out;
+
+    if (dsa_enabled && bpf_set_dsa_config(bpf, &args.dsa_config) != BPFWG_RC_OK)
+        goto bpf_destroy;
 
     if (bpf_set_config(bpf, &args.config) != BPFWG_RC_OK)
         goto bpf_destroy;
@@ -43,7 +63,7 @@ int main(int argc, char *argv[]) {
     bpfwg_info("Loading BPF program and attaching to network interfaces ...\n");
 
     // Attach the program to the specified interface names
-    if (bpf_attach_program(bpf, args.hook, args.ifaces, args.ifaces_count) != BPFWG_RC_OK)
+    if (bpf_attach_program(bpf, args.hook, attach_ifaces, attach_ifaces_count) != BPFWG_RC_OK)
         goto bpf_destroy;
 
     signal(SIGINT, empty_signal_handler);
@@ -55,10 +75,11 @@ int main(int argc, char *argv[]) {
     pause();
     bpfwg_info("\nUnloading ...\n");
 
-    bpf_detach_program(bpf, args.hook, args.ifaces, args.ifaces_count);
+    bpf_detach_program(bpf, args.hook, attach_ifaces, attach_ifaces_count);
 bpf_destroy:
     bpf_destroy(bpf);
 out:
+    bpfwg_dsa_attach_free(&dsa_attach);
     free_cmd_args(&args);
     return ret;
 }

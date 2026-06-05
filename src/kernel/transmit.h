@@ -24,23 +24,19 @@ __u32 bpf_skb_checksum(struct __sk_buff *skb, __u32 offset,
 
 
 __always_inline static
-__u32 push_eth_header(struct ethhdr *ethh, struct packet_data *pkt, struct bpf_fib_lookup *fib)
+__s32 push_eth_header(struct ethhdr *ethh, struct packet_data *pkt, struct bpf_fib_lookup *fib)
 {
     __push_eth_header(ethh, pkt, fib);
     return fib->ifindex;
 }
 
 __always_inline static
-__u32 push_l2_header(void *l2, struct packet_data *pkt, struct bpf_fib_lookup *fib)
+__s32 push_l2_header(void *l2, struct packet_data *pkt, struct bpf_fib_lookup *fib)
 {
-    switch (config.dsa_proto) {
-        case DSA_PROTO_NONE:
-            return push_eth_header(l2, pkt, fib);
-        case DSA_PROTO_MTK:
-            return push_mtk_header(l2, pkt, fib);
-        default:
-            return -1;
-    }
+    if (dsa.proto != DSA_PROTO_NONE)
+        return push_dsa_header(l2, pkt, fib);
+
+    return push_eth_header(l2, pkt, fib);
 }
 
 __always_inline static
@@ -55,7 +51,7 @@ void restore_l2_header(struct packet_data *pkt, __u16 offset)
     if (!pkt->is_xdp)
         return;
 
-    switch (config.dsa_proto) {
+    switch (dsa.proto) {
         case DSA_PROTO_NONE:
             return restore_eth_header(pkt, offset);
         case DSA_PROTO_MTK:
@@ -245,7 +241,7 @@ bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family,
 
 
 __always_inline static
-int output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_len)
+__s32 output(struct packet_data *pkt, sa_family_t family, __u16 offset, __u16 eth_len)
 {
     void *ethh = pkt->data + offset;
     struct bpf_fib_lookup fib = {};

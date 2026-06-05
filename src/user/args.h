@@ -12,7 +12,9 @@ struct cmd_args {
     unsigned int ifaces_count;
 
     enum bpf_hook hook;
+    bool dsa;
     struct bpfwg_config config;
+    struct bpfwg_dsa dsa_config;
     struct bpfwg_cpu_list rss_excluded_cpus;
 };
 

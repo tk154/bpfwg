@@ -32,7 +32,7 @@ static void print_usage(const char *prog, FILE *out) {
     fprintf(out, "Options:\n");
     fprintf(out, "  -?, -h, --help                 Show this help text and exit.\n");
     fprintf(out, "  -c, --conntrack                Require conntrack entries before redirecting packets.\n");
-    fprintf(out, "  -d, --dsa PROTO                Enable DSA handling. Supported values: mtk.\n");
+    fprintf(out, "  -d, --dsa                      Require DSA discovery and attach to the conduit.\n");
     fprintf(out, "  -e, --exclude-cpus LIST        Exclude CPUs from RSS targets, e.g. 0,1,4-7.\n");
     fprintf(out, "  -l, --log-level LEVEL          Set log level: error, warning, info, debug, verbose.\n");
     fprintf(out, "                                  Default: info.\n");
@@ -45,7 +45,7 @@ static void print_usage(const char *prog, FILE *out) {
     fprintf(out, "Examples:\n");
     fprintf(out, "  %s tc eth0 -o src/kernel/obj/wg_le.o\n", prog);
     fprintf(out, "  %s xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0\n", prog);
-    fprintf(out, "  %s xdp eth0 -o src/kernel/obj/wg_le.o -d mtk --conntrack --udp\n", prog);
+    fprintf(out, "  %s xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp\n", prog);
 }
 
 static bool is_help_arg(const char *arg) {
@@ -95,14 +95,6 @@ static bool parse_log_level(char* log_level) {
     }
 
     return true;
-}
-
-static enum dsa_proto parse_dsa_proto(const char *dsa_str) {
-    if (!strcmp(dsa_str, "mtk"))
-        return DSA_PROTO_MTK;
-
-    bpfwg_error("Unsupported DSA protocol '%s'. \n\n", dsa_str);
-    return DSA_PROTO_NONE;
 }
 
 static bool cpu_list_contains(const struct bpfwg_cpu_list *cpus, unsigned int cpu) {
@@ -197,7 +189,7 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
 
     struct option options[] = {
         { "conntrack",    no_argument,       0, 'c' },
-        { "dsa",          required_argument, 0, 'd' },
+        { "dsa",          no_argument,       0, 'd' },
         { "exclude-cpus", required_argument, 0, 'e' },
         { "help",         no_argument,       0, 'h' },
         { "log-level",    required_argument, 0, 'l' },
@@ -214,16 +206,14 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
         }
     }
 
-    while ((opt = getopt_long(argc, argv, "cd:e:hl:o:r:u?", options, &opt_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cde:hl:o:r:u?", options, &opt_index)) != -1) {
         switch (opt) {
             case 'c':
                 args->config.conntrack = true;
             break;
 
             case 'd':
-                args->config.dsa_proto = parse_dsa_proto(optarg);
-                if (args->config.dsa_proto == DSA_PROTO_NONE)
-                    return BPFWG_RC_ERR;
+                args->dsa = true;
             break;
 
             case 'e':
@@ -292,9 +282,10 @@ int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     args->rss_excluded_cpus.cpus = NULL;
     args->rss_excluded_cpus.count = 0;
 
-    args->config.dsa_proto = DSA_PROTO_NONE;
+    args->dsa = false;
     args->config.conntrack = false;
     args->config.udp_nocheck = false;
+    memset(&args->dsa_config, 0, sizeof(args->dsa_config));
 
     rc = parse_cmd_args(argc, argv, args);
     if (rc == BPFWG_RC_ERR)

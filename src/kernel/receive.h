@@ -101,14 +101,10 @@ bool parse_wg_header(struct packet_data *pkt, struct wg_header **wg)
 __always_inline static
 bool parse_l2_header(struct packet_data *pkt, struct l2_header *l2)
 {
-    switch (config.dsa_proto) {
-        case DSA_PROTO_NONE:
-            return parse_eth_header(pkt, l2);
-        case DSA_PROTO_MTK:
-            return parse_mtk_header(pkt, l2);
-        default:
-            return false;
-    }
+    if (dsa.proto != DSA_PROTO_NONE)
+        return parse_dsa_header(pkt, l2);
+
+    return parse_eth_header(pkt, l2);
 }
 
 __always_inline static
