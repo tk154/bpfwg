@@ -9,15 +9,16 @@
 #include <linux/udp.h>
 #include <linux/in.h>
 
+#include "../dsa/dsa.h"
 
-#define RSS_INDIR_MASK (BPFWG_RSS_INDIR_MAP_SIZE - 1)
+#define BPFWG_RSS_INDIR_MASK (BPFWG_RSS_INDIR_SIZE - 1)
 
-#define check_header(hdr, data, data_end) \
+#define check_header(hdr, data, data_end, rc) \
     do { \
         hdr = data; \
         data += sizeof(*hdr); \
         if (data > data_end) \
-            return XDP_PASS; \
+            return rc; \
     } while (0);
 
 struct {
@@ -27,26 +28,33 @@ struct {
     __uint(max_entries, 1);
 } BPFWG_RSS_CPU_MAP SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, __u32);
-    __uint(max_entries, BPFWG_RSS_INDIR_MAP_SIZE);
-} BPFWG_RSS_INDIR_MAP SEC(".maps");
+SEC(BPFWG_RSS_SECTION)
+struct bpfwg_rss rss = {
+    .cpu_count = 1,
+    .indir = { 0 },
+};
 
-SEC(BPFWG_RSS_CPU_COUNT_SECTION)
-__u32 cpu_count = 1;
-
-__always_inline static __s32 rss_lookup_cpu(__u32 key)
+__always_inline static
+__u32 rss_lookup_cpu(__u32 key)
 {
-    __u32 *cpu;
+    return rss.indir[key & BPFWG_RSS_INDIR_MASK];
+}
 
-    key &= RSS_INDIR_MASK;
-    cpu = bpf_map_lookup_elem(&BPFWG_RSS_INDIR_MAP, &key);
-    if (cpu)
-        return *cpu;
-
-    return -1;
+__always_inline static
+__be16 check_l2_header(void **data, void *data_end)
+{
+    switch (dsa.proto) {
+        case DSA_PROTO_NONE:
+            struct ethhdr *ethh;
+            check_header(ethh, *data, data_end, 0);
+            return ethh->h_proto;
+        case DSA_PROTO_MTK:
+            struct mtkhdr *mtkh;
+            check_header(mtkh, *data, data_end, 0);
+            return mtkh->h_proto;
+        default:
+            return 0;
+    }
 }
 
 #include "round_robin.h"

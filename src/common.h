@@ -22,15 +22,11 @@
 #define BPFWG_RSS_CPU_MAP_QUEUE_SIZE  16384
 
 #define BPFWG_DSA_MAX_PORTS           7
-
-#define BPFWG_RSS_INDIR_MAP           rss_indir_map
-#define BPFWG_RSS_INDIR_MAP_NAME      TO_STRING(BPFWG_RSS_INDIR_MAP)
-#define BPFWG_RSS_INDIR_MAP_SIZE      (1 << 8)
+#define BPFWG_RSS_INDIR_SIZE          (1 << 8)
 
 #define BPFWG_CONFIG_SECTION              ".rodata.config"
 #define BPFWG_DSA_SECTION                 ".rodata.dsa"
-#define BPFWG_RSS_CPU_COUNT_SECTION       ".rodata.rss.cpu_count"
-#define BPFWG_RSS_EXCLUDED_CPUS_SECTION   ".rodata.rss.excluded_cpus"
+#define BPFWG_RSS_SECTION                 ".rodata.rss"
 
 enum dsa_proto {
     DSA_PROTO_NONE = 0,
@@ -43,6 +39,11 @@ struct bpfwg_dsa {
     __u32 ifindex_base;
     __u32 port_to_ifindex[BPFWG_DSA_MAX_PORTS];
     __u32 ifindex_to_port[BPFWG_DSA_MAX_PORTS];
+};
+
+struct bpfwg_rss {
+    __u32 cpu_count;
+    __u32 indir[BPFWG_RSS_INDIR_SIZE];
 };
 
 struct bpfwg_config {

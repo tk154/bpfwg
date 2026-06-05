@@ -235,7 +235,6 @@ static int bpf_build_allowed_cpus(struct bpf_handle *bpf) {
 
 static int bpf_prepare_cpu_map(struct bpf_object *obj, __u32 cpu_count) {
     struct bpf_map *cpu_map;
-    __u32 *cpu_count_rodata;
 
     cpu_map = bpf_object__find_map_by_name(obj, BPFWG_RSS_CPU_MAP_NAME);
     if (!cpu_map) {
@@ -249,12 +248,26 @@ static int bpf_prepare_cpu_map(struct bpf_object *obj, __u32 cpu_count) {
         return BPFWG_RC_ERR;
     }
 
-    cpu_count_rodata = bpf_get_section_data(obj, BPFWG_RSS_CPU_COUNT_SECTION,
-        sizeof(*cpu_count_rodata));
-    if (!cpu_count_rodata)
+    return BPFWG_RC_OK;
+}
+
+static int bpf_set_rss_config(struct bpf_object *obj, const struct bpf_handle *bpf) {
+    struct bpfwg_rss *rss;
+    __u32 key;
+
+    if (!bpf->allowed_cpu_count) {
+        bpfwg_error("RSS CPU policy has no allowed CPUs.\n");
+        return BPFWG_RC_ERR;
+    }
+
+    rss = bpf_get_section_data(obj, BPFWG_RSS_SECTION, sizeof(*rss));
+    if (!rss)
         return BPFWG_RC_ERR;
 
-    *cpu_count_rodata = cpu_count;
+    rss->cpu_count = bpf->allowed_cpu_count;
+    for (key = 0; key < BPFWG_RSS_INDIR_SIZE; key++)
+        rss->indir[key] = bpf->allowed_cpus[key % bpf->allowed_cpu_count];
+
     return BPFWG_RC_OK;
 }
 
@@ -283,13 +296,16 @@ static int bpf_prepare_main_object(struct bpf_handle *bpf) {
         return BPFWG_RC_ERR;
     }
 
-    return bpf_prepare_cpu_map(bpf->obj, bpf->cpu_count);
+    if (bpf_prepare_cpu_map(bpf->obj, bpf->cpu_count) != BPFWG_RC_OK)
+        return BPFWG_RC_ERR;
+
+    return bpf_set_rss_config(bpf->obj, bpf);
 }
 
 static int bpf_populate_cpu_map(struct bpf_handle *bpf) {
     struct bpf_cpumap_val cpu_map_val;
-    int cpu_map_fd, indir_map_fd;
-    __u32 cpu_id, key;
+    int cpu_map_fd;
+    __u32 cpu_id;
     unsigned int i;
 
     cpu_map_fd = bpf_object__find_map_fd_by_name(bpf->obj, BPFWG_RSS_CPU_MAP_NAME);
@@ -307,22 +323,6 @@ static int bpf_populate_cpu_map(struct bpf_handle *bpf) {
 
         if (bpf_map_update_elem(cpu_map_fd, &cpu_id, &cpu_map_val, BPF_ANY) != 0) {
             bpfwg_error("Error updating CPU map entry: %s (-%d).\n",
-                strerror(errno), errno);
-            return BPFWG_RC_ERR;
-        }
-    }
-
-    indir_map_fd = bpf_object__find_map_fd_by_name(bpf->obj, BPFWG_RSS_INDIR_MAP_NAME);
-    if (indir_map_fd < 0) {
-        bpfwg_error("Error: Couldn't find BPF map %s.\n", BPFWG_RSS_INDIR_MAP_NAME);
-        return BPFWG_RC_ERR;
-    }
-
-    for (key = 0; key < BPFWG_RSS_INDIR_MAP_SIZE; key++) {
-        cpu_id = bpf->allowed_cpus[key % bpf->allowed_cpu_count];
-
-        if (bpf_map_update_elem(indir_map_fd, &key, &cpu_id, BPF_ANY) != 0) {
-            bpfwg_error("Error updating indirection map entry: %s (-%d).\n",
                 strerror(errno), errno);
             return BPFWG_RC_ERR;
         }
@@ -356,9 +356,6 @@ static int bpf_load_rss_objects(struct bpf_handle *bpf) {
 
     for (i = 0; i < bpf->rss_count; i++) {
         if (bpf_reuse_map(bpf, bpf->rss[i].obj, BPFWG_RSS_CPU_MAP_NAME) != BPFWG_RC_OK)
-            return BPFWG_RC_ERR;
-
-        if (bpf_reuse_map(bpf, bpf->rss[i].obj, BPFWG_RSS_INDIR_MAP_NAME) != BPFWG_RC_OK)
             return BPFWG_RC_ERR;
 
         if (bpf_object__load(bpf->rss[i].obj) != 0) {
@@ -562,6 +559,10 @@ static int bpf_ifindex_prepare_rss(struct bpf_handle *bpf, struct bpf_rss_progra
         return BPFWG_RC_ERR;
     }
 
+    if (bpf->dsa_enabled &&
+            bpf_set_dsa_config_obj(rss->obj, &bpf->dsa_config) != BPFWG_RC_OK)
+        return BPFWG_RC_ERR;
+
     if (bpf_set_programs_autoload(rss->obj, bpf->rss_prog_name, NULL) != BPFWG_RC_OK)
         return BPFWG_RC_ERR;
 
@@ -581,6 +582,9 @@ static int bpf_ifindex_prepare_rss(struct bpf_handle *bpf, struct bpf_rss_progra
     }
 
     if (bpf_prepare_cpu_map(rss->obj, bpf->cpu_count) != BPFWG_RC_OK)
+        return BPFWG_RC_ERR;
+
+    if (bpf_set_rss_config(rss->obj, bpf) != BPFWG_RC_OK)
         return BPFWG_RC_ERR;
 
     return BPFWG_RC_OK;
@@ -764,8 +768,7 @@ int bpf_set_config(struct bpf_handle *bpf, struct bpfwg_config *cfg) {
 
 int bpf_set_dsa_config(struct bpf_handle *bpf, const struct bpfwg_dsa *cfg) {
     if (bpf->obj_loaded) {
-        bpfwg_error("DSA config must be set before loading the BPF object.
-");
+        bpfwg_error("DSA config must be set before loading the BPF object.\n");
         return BPFWG_RC_ERR;
     }
 

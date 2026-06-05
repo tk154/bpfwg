@@ -1,3 +1,6 @@
+#ifndef ROUND_ROBIN_H
+#define ROUND_ROBIN_H
+
 struct cpu_iterator {
     struct bpf_spin_lock semaphore;
     __u32 cpu;
@@ -14,19 +17,23 @@ SEC("xdp")
 int round_robin(struct xdp_md *xdp)
 {
     struct cpu_iterator *iterator;
-    __u32 cpu, key = 0;
+    __u32 cpu, idx, key = 0;
 
     iterator = bpf_map_lookup_elem(&cpu_iterator_map, &key);
     if (!iterator)
         return XDP_ABORTED;
 
     bpf_spin_lock(&iterator->semaphore);
-    cpu = iterator->cpu;
+    idx = iterator->cpu;
 
-    if (++iterator->cpu == cpu_count)
+    if (++iterator->cpu == rss.cpu_count)
         iterator->cpu = 0;
 
     bpf_spin_unlock(&iterator->semaphore);
 
+    cpu = rss_lookup_cpu(idx);
     return bpf_redirect_map(&BPFWG_RSS_CPU_MAP, cpu, XDP_ABORTED);
 }
+
+
+#endif
