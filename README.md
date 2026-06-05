@@ -5,9 +5,9 @@ packet datapath for XDP and TC. The kernel program classifies packets with FIB
 lookups, encrypts forwarded inner packets, decrypts local WireGuard data packets,
 and redirects packets after rebuilding the L2/L3/L4 headers.
 
-The tree also contains a small libbpf userspace loader that configures the BPF
-object, attaches it to interfaces, and optionally prepares cpumap-based RSS
-programs.
+The tree also contains a small libbpf/libmnl userspace loader that configures
+the BPF object, attaches it to interfaces, and optionally prepares cpumap-based
+RSS programs.
 
 ## Layout
 
@@ -15,7 +15,7 @@ programs.
 - `src/kernel/`: XDP/TC WireGuard BPF program and helper headers.
 - `src/kernel/dsa/`: DSA-specific L2 parsing and transmit helpers.
 - `src/kernel/rss/`: optional XDP programs that redirect packets through a CPU map.
-- `src/user/`: libbpf loader, argument parsing, logging, and OpenWrt build helper.
+- `src/user/`: libbpf/libmnl loader, argument parsing, logging, and OpenWrt build helper.
 - `patches/`: kernel patches required by the BPF WireGuard/checksum helpers.
 
 ## Build
@@ -33,6 +33,10 @@ Build the userspace loader:
 ```sh
 make -C src/user
 ```
+
+The userspace loader links against `libbpf` and `libmnl`, so the corresponding
+development headers/libraries must be available in the host or target staging
+environment.
 
 For OpenWrt cross builds, pass the OpenWrt tree and target parameters expected by
 `src/user/OpenWrt.mk`, for example:
@@ -59,7 +63,7 @@ Options:
 
 - `-?`, `-h`, `--help`: print detailed help and exit.
 - `-c`, `--conntrack`: require conntrack entries before redirecting packets.
-- `-d`, `--dsa PROTO`: enable DSA support. Currently `mtk` is supported.
+- `-d`, `--dsa`: require DSA discovery. DSA is auto-detected when targets are DSA user ports or a DSA conduit.
 - `-e`, `--exclude-cpus LIST`: exclude CPUs from RSS targets, e.g. `0,1,4-7`.
 - `-l`, `--log-level LEVEL`: set `error`, `warning`, `info`, `debug`, or `verbose`.
 - `-o`, `--object PATH`: select the BPF object to load.
@@ -69,9 +73,9 @@ Options:
 Examples:
 
 ```sh
-sudo src/user/bin/host/bpfwg tc eth0 -o src/kernel/obj/wg_le.o
-sudo src/user/bin/host/bpfwg xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0
-sudo src/user/bin/host/bpfwg xdp eth0 -o src/kernel/obj/wg_le.o -d mtk --conntrack --udp
+./bpfwg tc eth0 -o src/kernel/obj/wg_le.o
+./bpfwg xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0
+./bpfwg xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp
 ```
 
 The loader stays in the foreground and detaches the programs when it receives
@@ -81,7 +85,8 @@ The loader stays in the foreground and detaches the programs when it receives
 
 RSS mode loads the main object with `xdp_wg_cpumap` as the cpumap program and
 loads one device-bound RSS program per attached interface. The RSS programs share
-`rss_cpu_map` and `rss_indir_map`; userspace populates both maps before attach.
+`rss_cpu_map`; userspace populates the cpumap and writes the RSS indirection
+table into the `.rodata.rss` config section before each object is loaded.
 
 Available RSS programs in the current tree are:
 
@@ -97,7 +102,7 @@ the device-bound RSS programs need device-backed XDP metadata support.
 
 - The TC program passes GSO/GRO-marked SKBs instead of rewriting them.
 - The BPF object expects patched WireGuard/checksum kfuncs from `patches/`.
-- The current DSA helper supports the MediaTek tag format used by the `mtk` mode.
+- The current DSA helper supports the MediaTek tag format `mtk`.
 
 ## eBPF Kernel API
 
