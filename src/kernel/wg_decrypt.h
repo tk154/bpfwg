@@ -50,8 +50,8 @@ struct wg_device *wg_decrypt_lookup_device(struct packet_data *pkt, __be16 dport
 }
 
 __always_inline static
-int bpf_wg_decrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
-                   struct wg_decrypt_layout *layout)
+enum wg_action bpf_wg_decrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
+                              struct wg_decrypt_layout *layout)
 {
     int ret = pkt->is_xdp ?
         bpf_xdp_wg_decrypt(pkt->ctx, layout->wgh_offset, layout->payload_len, wg_peer) :
@@ -59,19 +59,19 @@ int bpf_wg_decrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
 
     switch (ret) {
         case 0:
-            return true;
+            return WG_ACTION_REDIRECT;
         case -ENOKEY:
             bpf_printk("bpf_wg_decrypt: key not available");
-            return false;
+            return WG_ACTION_PASS;
         case -EKEYEXPIRED:
             bpf_printk("bpf_wg_decrypt: key has expired");
-            return false;
+            return WG_ACTION_PASS;
         case -EPROTO:
             bpf_printk("bpf_wg_decrypt: counter is invalid");
-            return false;
+            return WG_ACTION_DROP;
         default:
             bpf_printk("bpf_wg_decrypt: %d", ret);
-            return false;
+            return WG_ACTION_DROP;
     }
 }
 
@@ -130,10 +130,10 @@ __always_inline static
 enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
                           struct wg_decrypt_inner *inner)
 {
-    enum wg_action action = WG_ACTION_DROP;
     struct wg_decrypt_layout layout;
     struct wg_device *wg_device;
     struct wg_peer *wg_peer;
+    enum wg_action action;
 
     wg_device = wg_decrypt_lookup_device(pkt, header->l4.dest_port);
     if (!wg_device)
@@ -142,12 +142,14 @@ enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
     wg_peer = bpf_wg_peer_hashtable_lookup(wg_device, header->wg->receiver);
     if (!wg_peer) {
         bpf_printk("bpf_wg_peer_hashtable_lookup error");
+        action = WG_ACTION_DROP;
         goto bpf_wg_device_put;
     }
 
     wg_decrypt_build_layout(header, &layout);
 
-    if (!bpf_wg_decrypt(pkt, wg_peer, &layout)) {
+    action = bpf_wg_decrypt(pkt, wg_peer, &layout);
+    if (action != WG_ACTION_REDIRECT) {
         /* Workaround for !read_ok */
         bpf_wg_peer_put(wg_peer);
         goto bpf_wg_device_put;
@@ -156,15 +158,13 @@ enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
     if (!wg_parse_inner_l3(pkt, header, &layout, inner)) {
         /* Workaround for !read_ok */
         bpf_wg_peer_put(wg_peer);
+        action = WG_ACTION_DROP;
         goto bpf_wg_device_put;
     }
 
     if (!wg_source_allowed(wg_device, wg_peer, inner))
-        goto bpf_wg_peer_put;
+        action = WG_ACTION_DROP;
 
-    action = WG_ACTION_REDIRECT;
-
-bpf_wg_peer_put:
     bpf_wg_peer_put(wg_peer);
 bpf_wg_device_put:
     bpf_wg_device_put(wg_device);

@@ -94,8 +94,8 @@ void wg_encrypt_build_layout(struct packet_header *header, __u16 iph_len,
 }
 
 __always_inline static
-int bpf_wg_encrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
-                   struct wg_encrypt_layout *layout)
+enum wg_action bpf_wg_encrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
+                              struct wg_encrypt_layout *layout)
 {
     int ret = pkt->is_xdp ?
         bpf_xdp_wg_encrypt(pkt->ctx, layout->wg_offset, layout->wg_len, wg_peer):
@@ -103,19 +103,19 @@ int bpf_wg_encrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
 
     switch (ret) {
         case 0:
-            return true;
+            return WG_ACTION_REDIRECT;
         case -ENOKEY:
             bpf_printk("bpf_wg_decrypt: key not available");
-            return false;
+            return WG_ACTION_PASS;
         case -EKEYEXPIRED:
             bpf_printk("bpf_wg_decrypt: key has expired");
-            return false;
+            return WG_ACTION_PASS;
         case -EPROTO:
             bpf_printk("bpf_wg_decrypt: counter has expired");
-            return false;
+            return WG_ACTION_PASS;
         default:
             bpf_printk("bpf_wg_decrypt: %d", ret);
-            return false;
+            return WG_ACTION_DROP;
     }
 }
 
@@ -123,10 +123,10 @@ __always_inline static
 enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
                           int wg_ifindex, struct wg_encrypt_endpoint *endpoint)
 {
-    enum wg_action action = WG_ACTION_DROP;
     struct wg_encrypt_layout layout;
     struct wg_device *wg_device;
     struct wg_peer *wg_peer;
+    enum wg_action action;
 
     wg_device = wg_encrypt_lookup_device(pkt, wg_ifindex);
     if (!wg_device)
@@ -135,25 +135,29 @@ enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
     wg_peer = wg_encrypt_lookup_peer(wg_device, header);
     if (!wg_peer) {
         bpf_printk("bpf_wg_peer_allowedips_lookup error");
+        action = WG_ACTION_DROP;
         goto bpf_wg_device_put;
     }
 
-    if (!wg_encrypt_resolve_endpoint(wg_peer, endpoint))
+    if (!wg_encrypt_resolve_endpoint(wg_peer, endpoint)) {
+        action = WG_ACTION_PASS;
         goto bpf_wg_peer_put;
+    }
 
     wg_encrypt_build_layout(header, endpoint->iph_len, &layout);
 
-    if (!bpf_adjust_packet(pkt, layout.header_len, layout.trailer_len, endpoint->family))
+    if (!bpf_adjust_packet(pkt, layout.header_len, layout.trailer_len, endpoint->family)) {
+        action = WG_ACTION_DROP;
         goto bpf_wg_peer_put;
+    }
 
-    if (!bpf_wg_encrypt(pkt, wg_peer, &layout))
+    action = bpf_wg_encrypt(pkt, wg_peer, &layout);
+    if (action != WG_ACTION_REDIRECT)
         goto bpf_wg_peer_put;
 
     if (!create_udp_tunnel(pkt, endpoint->family, &endpoint->tuple,
                            layout.iph_offset, layout.tot_len))
-        goto bpf_wg_peer_put;
-
-    action = WG_ACTION_REDIRECT;
+        action = WG_ACTION_DROP;
 
 bpf_wg_peer_put:
     bpf_wg_peer_put(wg_peer);
