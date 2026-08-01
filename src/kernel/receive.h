@@ -15,7 +15,6 @@
 #include "dsa/dsa.h"
 
 #define IP_VERSION(ip)	(*(__u8 *)(ip) >> 4)
-#define WG_MESSAGE_DATA bpf_le32_to_cpu(4)
 
 
 __always_inline static
@@ -87,13 +86,7 @@ bool parse_udp_header(struct packet_data *pkt, struct l4_header *l4)
 __always_inline static
 bool parse_wg_header(struct packet_data *pkt, struct wg_header **wg)
 {
-    struct wg_header *wg_header;
-    parse_header(wg_header, pkt);
-
-    if (wg_header->type != WG_MESSAGE_DATA)
-        return false;
-
-    *wg = wg_header;
+    parse_header(*wg, pkt);
     return true;
 }
 
@@ -155,18 +148,16 @@ int fib_lookup(struct packet_data *pkt, struct l3_header *l3)
         ip6cpy(fib.ipv6_dst, l3->dest_ip);
     }
 
-    ret = bpf_fib_lookup(pkt->ctx, &fib, sizeof(fib), 0);
+    ret = bpf_fib_lookup(pkt->ctx, &fib, sizeof(fib), BPF_FIB_LOOKUP_SKIP_NEIGH);
     switch (ret) {
         case BPF_FIB_LKUP_RET_SUCCESS:
             return fib.ifindex;
-        case BPF_FIB_LKUP_RET_NOT_FWDED:
-            return 0;
         case BPF_FIB_LKUP_RET_FRAG_NEEDED:
             bpf_printk("Fragmentation required: len = %u, mtu = %u",
                 l3->tot_len, fib.tot_len);
         default:
             //bpf_printk("%s: %d", __func__, ret);
-            return -1;
+            return 0;
     }
 }
 

@@ -31,28 +31,50 @@ struct wg_encrypt_layout {
 
 
 __always_inline static
-struct wg_device *wg_encrypt_lookup_device(struct packet_data *pkt, int wg_ifindex)
+enum wg_action wg_encrypt_lookup_device(struct packet_data *pkt, int wg_ifindex,
+                                        struct wg_device **wg_device)
 {
-    return pkt->is_xdp ? bpf_xdp_wg_device_get_by_index(pkt->ctx, wg_ifindex) :
-        bpf_skb_wg_device_get_by_index(pkt->ctx, wg_ifindex);
+    int err;
+
+    *wg_device = pkt->is_xdp ?
+        bpf_xdp_wg_device_get_by_index(pkt->ctx, wg_ifindex, BPF_F_CURRENT_NETNS, &err):
+        bpf_skb_wg_device_get_by_index(pkt->ctx, wg_ifindex, BPF_F_CURRENT_NETNS, &err);
+
+    if (*wg_device)
+        return WG_ACTION_REDIRECT;
+
+    if (err != -ENODEV) {
+        bpf_printk("bpf_wg_device_get_by_index error: %d", err);
+        return WG_ACTION_DROP;
+    }
+
+    return WG_ACTION_PASS;
 }
 
 __always_inline static
-struct wg_peer *wg_encrypt_lookup_peer(struct wg_device *wg_device,
-                                       struct packet_header *header)
+enum wg_action wg_encrypt_lookup_peer(struct wg_device *wg_device,
+                                      struct packet_header *header,
+                                      struct wg_peer **peer)
 {
     __u16 daddr_len = header->l3.family == AF_INET ? 4 : 16;
 
-    return bpf_wg_peer_allowedips_lookup(wg_device, header->l3.dest_ip, daddr_len);
+    *peer = bpf_wg_peer_allowedips_lookup(wg_device, header->l3.dest_ip,
+                                          daddr_len);
+    if (*peer)
+        return WG_ACTION_REDIRECT;
+
+    bpf_print_ip("No peer has allowed IPs matching ",
+        header->l3.dest_ip, header->l3.family);
+    return WG_ACTION_DROP;
 }
 
 __always_inline static
-bool wg_encrypt_resolve_endpoint(struct wg_peer *wg_peer,
+bool wg_encrypt_resolve_endpoint(struct wg_peer *peer,
                                  struct wg_encrypt_endpoint *endpoint)
 {
     int family;
 
-    family = bpf_wg_endpoint_tuple_get(wg_peer, &endpoint->tuple, sizeof(endpoint->tuple));
+    family = bpf_wg_endpoint_tuple_get(peer, &endpoint->tuple);
     switch (family) {
         case AF_INET:
             endpoint->family = AF_INET;
@@ -75,46 +97,61 @@ __u16 wg_encrypt_padding(__u16 tot_len)
 }
 
 __always_inline static
-void wg_encrypt_build_layout(struct packet_header *header, __u16 iph_len,
+void wg_encrypt_build_layout(struct l3_header *l3, __u16 iph_len,
                              struct wg_encrypt_layout *layout)
 {
     __u16 padding_len;
 
     layout->header_len = iph_len + sizeof(struct udphdr) + sizeof(struct wg_header);
 
-    layout->tot_len = header->l3.tot_len;
+    layout->tot_len = l3->tot_len;
     padding_len = wg_encrypt_padding(layout->tot_len);
     layout->trailer_len = padding_len + CHACHA20POLY1305_AUTHTAG_SIZE;
 
     layout->tot_len += layout->header_len + layout->trailer_len;
-    layout->wg_len = layout->tot_len - iph_len - sizeof(struct udphdr);
+    layout->wg_len = layout->tot_len - iph_len -
+        sizeof(struct udphdr) - sizeof(struct wg_header);
 
-    layout->iph_offset = header->l3.offset;
-    layout->wg_offset = layout->iph_offset + iph_len + sizeof(struct udphdr);
+    layout->iph_offset = l3->offset;
+    layout->wg_offset = layout->iph_offset + iph_len +
+        sizeof(struct udphdr) + sizeof(struct wg_header);
 }
 
 __always_inline static
-enum wg_action bpf_wg_encrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
-                              struct wg_encrypt_layout *layout)
+enum wg_action wg_encrypt_packet(struct packet_data *pkt, struct wg_encrypt_layout *layout,
+                                 struct wg_peer *peer, __le32 *key_idx, __u64 *nonce)
 {
-    int ret = pkt->is_xdp ?
-        bpf_xdp_wg_encrypt(pkt->ctx, layout->wg_offset, layout->wg_len, wg_peer):
-        bpf_skb_wg_encrypt(pkt->ctx, layout->wg_offset, layout->wg_len, wg_peer);
+    struct bpf_dynptr ptr;
+    long ret;
+
+    ret = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
+        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
+
+    if (ret) {
+        bpf_printk("bpf_dynptr_from_xdp/sbk: %d", ret);
+        return WG_ACTION_DROP;
+    }
+
+    ret = bpf_dynptr_adjust(&ptr, layout->wg_offset,
+            layout->wg_offset + layout->wg_len);
+
+    if (ret) {
+        bpf_printk("bpf_dynptr_adjust: %d", ret);
+        return WG_ACTION_DROP;
+    }
+
+    ret = bpf_wg_encrypt(&ptr, peer, nonce);
+    if (ret >= 0) {
+        *key_idx = (__le32)ret;
+        return WG_ACTION_REDIRECT;
+    }
 
     switch (ret) {
-        case 0:
-            return WG_ACTION_REDIRECT;
-        case -ENOKEY:
-            bpf_printk("bpf_wg_decrypt: key not available");
-            return WG_ACTION_PASS;
         case -EKEYEXPIRED:
-            bpf_printk("bpf_wg_decrypt: key has expired");
-            return WG_ACTION_PASS;
-        case -EPROTO:
-            bpf_printk("bpf_wg_decrypt: counter has expired");
+            bpf_printk("bpf_wg_encrypt: key has expired");
             return WG_ACTION_PASS;
         default:
-            bpf_printk("bpf_wg_decrypt: %d", ret);
+            bpf_printk("bpf_wg_encrypt: %d", ret);
             return WG_ACTION_DROP;
     }
 }
@@ -125,42 +162,42 @@ enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
 {
     struct wg_encrypt_layout layout;
     struct wg_device *wg_device;
-    struct wg_peer *wg_peer;
     enum wg_action action;
+    struct wg_peer *peer;
+    __le32 key_idx;
+    __u64 counter;
 
-    wg_device = wg_encrypt_lookup_device(pkt, wg_ifindex);
-    if (!wg_device)
-        return WG_ACTION_PASS;
+    action = wg_encrypt_lookup_device(pkt, wg_ifindex, &wg_device);
+    if (action != WG_ACTION_REDIRECT)
+        return action;
 
-    wg_peer = wg_encrypt_lookup_peer(wg_device, header);
-    if (!wg_peer) {
-        bpf_printk("bpf_wg_peer_allowedips_lookup error");
-        action = WG_ACTION_DROP;
+    action = wg_encrypt_lookup_peer(wg_device, header, &peer);
+    if (action != WG_ACTION_REDIRECT)
         goto bpf_wg_device_put;
-    }
 
-    if (!wg_encrypt_resolve_endpoint(wg_peer, endpoint)) {
+    if (!wg_encrypt_resolve_endpoint(peer, endpoint)) {
         action = WG_ACTION_PASS;
-        goto bpf_wg_peer_put;
+        goto bpf_wg_keypair_put;
     }
 
-    wg_encrypt_build_layout(header, endpoint->iph_len, &layout);
+    wg_encrypt_build_layout(&header->l3, endpoint->iph_len, &layout);
 
     if (!bpf_adjust_packet(pkt, layout.header_len, layout.trailer_len, endpoint->family)) {
+        bpf_printk("wg_encrypt: bpf_adjust_packet error");
         action = WG_ACTION_DROP;
-        goto bpf_wg_peer_put;
+        goto bpf_wg_keypair_put;
     }
 
-    action = bpf_wg_encrypt(pkt, wg_peer, &layout);
+    action = wg_encrypt_packet(pkt, &layout, peer, &key_idx, &counter);
     if (action != WG_ACTION_REDIRECT)
-        goto bpf_wg_peer_put;
+        goto bpf_wg_keypair_put;
 
-    if (!create_udp_tunnel(pkt, endpoint->family, &endpoint->tuple,
-                           layout.iph_offset, layout.tot_len))
+    if (!create_wg_tunnel(pkt, endpoint->family, &endpoint->tuple,
+                          layout.iph_offset, layout.tot_len, key_idx, counter))
         action = WG_ACTION_DROP;
 
-bpf_wg_peer_put:
-    bpf_wg_peer_put(wg_peer);
+bpf_wg_keypair_put:
+    bpf_wg_peer_put(peer);
 bpf_wg_device_put:
     bpf_wg_device_put(wg_device);
     return action;

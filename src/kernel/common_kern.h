@@ -68,7 +68,7 @@ struct l4_header {
 
 struct wg_header {
     __le32 type;
-    __le32 receiver;
+    __le32 key_idx;
     __le64 counter;
 };
 
@@ -79,6 +79,10 @@ struct packet_header {
     struct wg_header *wg;
 };
 
+
+int bpf_dynptr_from_xdp(struct xdp_md *xdp, __u64 flags, struct bpf_dynptr *ptr) __ksym;
+int bpf_dynptr_from_skb(struct __sk_buff *skb, __u64 flags, struct bpf_dynptr *ptr) __ksym;
+int bpf_dynptr_adjust(const struct bpf_dynptr *p, __u64 start, __u64 end) __ksym;
 
 __always_inline static
 bool bpf_xdp_adjust_packet(struct packet_data *pkt, int head, int tail)
@@ -154,6 +158,28 @@ void ip6cpy(__be32 dest[4], const __be32 src[4])
 }
 
 __always_inline static
+__u32 bpf_sock_tuple_from_header(struct bpf_sock_tuple *tuple, struct l3_header *l3, struct l4_header *l4)
+{
+    switch (l3->family) {
+        case AF_INET:
+            tuple->ipv4.saddr = *l3->src_ip;
+            tuple->ipv4.daddr = *l3->dest_ip;
+            tuple->ipv4.sport =  l4->src_port;
+            tuple->ipv4.dport =  l4->dest_port;
+            return sizeof(tuple->ipv4);
+        case AF_INET6:
+            ip6cpy(tuple->ipv6.saddr, l3->src_ip);
+            ip6cpy(tuple->ipv6.daddr, l3->dest_ip);
+            tuple->ipv6.sport = l4->src_port;
+            tuple->ipv6.dport = l4->dest_port;
+            return sizeof(tuple->ipv6);
+        default:
+            return 0;
+    }
+}
+
+
+__always_inline static
 void bpf_print_ipv4(const char *prefix, const void *ip_addr)
 {
     const __u8 *ip = ip_addr;
@@ -169,6 +195,12 @@ void bpf_print_ipv6(const char *prefix, const void *ip_addr)
     bpf_printk("%s%x:%x:%x:%x:%x:%x:%x:%x", prefix,
         bpf_ntohs(ip[0]), bpf_ntohs(ip[1]), bpf_ntohs(ip[2]), bpf_ntohs(ip[3]),
         bpf_ntohs(ip[4]), bpf_ntohs(ip[5]), bpf_ntohs(ip[6]), bpf_ntohs(ip[7]));
+}
+
+__always_inline static
+void bpf_print_ip(const char *prefix, const void *ip_addr, sa_family_t family)
+{
+    family == AF_INET ? bpf_print_ipv4(prefix, ip_addr) : bpf_print_ipv6(prefix, ip_addr);
 }
 
 

@@ -25,44 +25,64 @@ struct wg_decrypt_inner {
 struct wg_decrypt_layout {
     __u16 iph_len;
     __u16 header_len;
-    __u16 wgh_offset;
+    __u16 payload_offset;
     __u16 payload_len;
 };
 
+
+__always_inline static
+enum wg_action wg_decrypt_lookup_key(struct wg_device *wg_device, struct wg_header *wg_header,
+                                     struct noise_keypair **keypair, struct wg_peer **peer)
+{
+    *keypair = bpf_wg_keypair_hashtable_lookup(wg_device, wg_header->key_idx, (unsigned long *)peer);
+    if (*keypair)
+        return WG_ACTION_REDIRECT;
+
+    if (*peer) {
+        bpf_printk("Key has expired for key index %u", wg_header->key_idx);
+        return WG_ACTION_PASS; 
+    }
+
+    bpf_printk("No peer has key index matching %u", wg_header->key_idx);
+    return WG_ACTION_DROP;
+}
 
 __always_inline static
 void wg_decrypt_build_layout(struct packet_header *header, struct wg_decrypt_layout *layout)
 {
     layout->iph_len = header->l3.family == AF_INET ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
     layout->header_len = layout->iph_len + sizeof(struct udphdr) + sizeof(struct wg_header);
-    layout->wgh_offset = header->l3.offset + layout->iph_len + sizeof(struct udphdr);
-    layout->payload_len = header->l4.payload_len;
+    layout->payload_offset = header->l3.offset + layout->iph_len + sizeof(struct udphdr) + sizeof(struct wg_header);
+    layout->payload_len = header->l4.payload_len - sizeof(struct wg_header);
 }
 
 __always_inline static
-struct wg_device *wg_decrypt_lookup_device(struct packet_data *pkt, __be16 dport)
+enum wg_action wg_decrypt_packet(struct packet_data *pkt, struct wg_decrypt_layout *layout,
+                                 struct noise_keypair *keypair, __u64 nonce)
 {
-    __u16 port = bpf_ntohs(dport);
+    struct bpf_dynptr ptr;
+    long ret;
 
-    return pkt->is_xdp ?
-        bpf_xdp_wg_device_get_by_port(pkt->ctx, port) :
-        bpf_skb_wg_device_get_by_port(pkt->ctx, port);
-}
+    ret = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
+        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
 
-__always_inline static
-enum wg_action bpf_wg_decrypt(struct packet_data *pkt, struct wg_peer *wg_peer,
-                              struct wg_decrypt_layout *layout)
-{
-    int ret = pkt->is_xdp ?
-        bpf_xdp_wg_decrypt(pkt->ctx, layout->wgh_offset, layout->payload_len, wg_peer) :
-        bpf_skb_wg_decrypt(pkt->ctx, layout->wgh_offset, layout->payload_len, wg_peer);
+    if (ret) {
+        bpf_printk("bpf_dynptr_from_xdp/skb: %d", ret);
+        return WG_ACTION_DROP;
+    }
 
+    ret = bpf_dynptr_adjust(&ptr, layout->payload_offset,
+            layout->payload_offset + layout->payload_len);
+
+    if (ret) {
+        bpf_printk("bpf_dynptr_adjust: %d", ret);
+        return WG_ACTION_DROP;
+    }
+
+    ret = bpf_wg_decrypt(&ptr, keypair, nonce);
     switch (ret) {
         case 0:
             return WG_ACTION_REDIRECT;
-        case -ENOKEY:
-            bpf_printk("bpf_wg_decrypt: key not available");
-            return WG_ACTION_PASS;
         case -EKEYEXPIRED:
             bpf_printk("bpf_wg_decrypt: key has expired");
             return WG_ACTION_PASS;
@@ -105,67 +125,65 @@ bool wg_parse_inner_l3(struct packet_data *pkt, struct packet_header *header,
 }
 
 __always_inline static
-bool wg_source_allowed(struct wg_device *wg_device, struct wg_peer *wg_peer,
+bool wg_source_allowed(struct wg_device *wg_device, struct wg_peer *peer,
                        struct wg_decrypt_inner *inner)
 {
     struct wg_peer *routed_peer;
 
     routed_peer = bpf_wg_peer_allowedips_lookup(wg_device, inner->l3.src_ip,
                                                 inner->addr_len);
-    if (routed_peer)
+    if (routed_peer) {
         bpf_wg_peer_put(routed_peer);
+        if (routed_peer == peer)
+            return true;
+    }
 
-    if (wg_peer == routed_peer)
-        return true;
-
-    if (inner->l3.family == AF_INET)
-        bpf_print_ipv4("Packet has unallowed source IP ", inner->l3.src_ip);
-    else
-        bpf_print_ipv6("Packet has unallowed source IP ", inner->l3.src_ip);
-
+    bpf_print_ip("Packet has unallowed source IP ",
+        inner->l3.src_ip, inner->l3.family);
     return false;
 }
 
 __always_inline static
 enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
-                          struct wg_decrypt_inner *inner)
+                          struct bpf_sock *sock, struct wg_decrypt_inner *inner)
 {
     struct wg_decrypt_layout layout;
+    struct noise_keypair *keypair;
     struct wg_device *wg_device;
-    struct wg_peer *wg_peer;
     enum wg_action action;
+    struct wg_peer *peer;
+    __u64 counter;
 
-    wg_device = wg_decrypt_lookup_device(pkt, header->l4.dest_port);
+    wg_device = bpf_wg_device_get_from_sk((struct sock *)sock);
     if (!wg_device)
         return WG_ACTION_PASS;
 
-    wg_peer = bpf_wg_peer_hashtable_lookup(wg_device, header->wg->receiver);
-    if (!wg_peer) {
-        bpf_printk("bpf_wg_peer_hashtable_lookup error");
-        action = WG_ACTION_DROP;
+    action = wg_decrypt_lookup_key(wg_device, header->wg, &keypair, &peer);
+    if (action != WG_ACTION_REDIRECT)
         goto bpf_wg_device_put;
-    }
 
     wg_decrypt_build_layout(header, &layout);
+    counter = bpf_le64_to_cpu(header->wg->counter);
 
-    action = bpf_wg_decrypt(pkt, wg_peer, &layout);
+    action = wg_decrypt_packet(pkt, &layout, keypair, counter);
     if (action != WG_ACTION_REDIRECT) {
         /* Workaround for !read_ok */
-        bpf_wg_peer_put(wg_peer);
+        bpf_wg_keypair_put(keypair);
         goto bpf_wg_device_put;
     }
 
     if (!wg_parse_inner_l3(pkt, header, &layout, inner)) {
         /* Workaround for !read_ok */
-        bpf_wg_peer_put(wg_peer);
+        bpf_wg_keypair_put(keypair);
         action = WG_ACTION_DROP;
         goto bpf_wg_device_put;
     }
 
-    if (!wg_source_allowed(wg_device, wg_peer, inner))
+    if (!wg_source_allowed(wg_device, peer, inner))
         action = WG_ACTION_DROP;
 
-    bpf_wg_peer_put(wg_peer);
+//bpf_wg_keypair_put:
+    bpf_wg_keypair_put(keypair);
 bpf_wg_device_put:
     bpf_wg_device_put(wg_device);
     return action;

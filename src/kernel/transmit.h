@@ -11,16 +11,10 @@
 
 #include <sys/socket.h>
 
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
-
+#include "endian.h"
 #include "dsa/dsa.h"
 
-
-__u32 bpf_xdp_checksum(struct xdp_md *xdp, __u32 offset,
-                       __u32 len, __u32 csum) __ksym;
-__u32 bpf_skb_checksum(struct __sk_buff *skb, __u32 offset,
-                       __u32 len, __u32 csum) __ksym;
+__s64 bpf_dynptr_checksum(struct bpf_dynptr *ptr, __u32 csum) __ksym;
 
 
 __always_inline static
@@ -80,9 +74,11 @@ __sum16 ip_checksum(struct iphdr *iph)
 }
 
 __always_inline static
-__sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __u64 sum)
+__sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __s64 sum)
 {
+    struct bpf_dynptr ptr;
     struct udphdr *udph;
+    int err;
 
     udph = pkt->data + offset;
     if ((void *)(udph + 1) > pkt->data_end)
@@ -93,8 +89,16 @@ __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __u64 sum)
     sum += IPPROTO_UDP << 8;
     sum += udph->len;
 
-    sum = pkt->is_xdp ? bpf_xdp_checksum(pkt->ctx, offset, len, sum):
-        bpf_skb_checksum(pkt->ctx, offset, len, sum);
+    err = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
+        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
+
+    if (err)
+        return 0;
+
+    bpf_dynptr_adjust(&ptr, offset, offset + len);
+    sum = bpf_dynptr_checksum(&ptr, sum);
+    if (sum < 0)
+        return 0;
 
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
@@ -108,7 +112,8 @@ __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __u64 sum)
 }
 
 __always_inline static
-__sum16 udp_v4_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __be32 saddr, __be32 daddr)
+__sum16 udp_v4_checksum(struct packet_data *pkt, __u8 offset,
+                        __u16 len, __be32 saddr, __be32 daddr)
 {
     __u64 sum = 0;
 
@@ -126,7 +131,7 @@ __sum16 udp_v4_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __be32 
 
 __always_inline static
 __sum16 udp_v6_checksum(struct packet_data *pkt, __u8 offset, __u16 len,
-                        const struct in6_addr *saddr, const struct in6_addr *daddr)
+                        struct in6_addr *saddr, struct in6_addr *daddr)
 {
     __u64 sum = 0;
     int i;
@@ -151,8 +156,22 @@ __sum16 udp_v6_checksum(struct packet_data *pkt, __u8 offset, __u16 len,
 
 
 __always_inline static
-bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
-                        __u8 iph_offset, __u16 tot_len)
+bool push_wg_header(void *data, void *data_end, __le32 key_idx, __u64 counter)
+{
+    struct wg_header *wgh = data;
+
+    if ((void *)(wgh + 1) > data_end)
+        return false;
+
+    wgh->type = bpf_cpu_to_le32(WG_MESSAGE_DATA);
+    wgh->key_idx = key_idx;
+    wgh->counter = bpf_cpu_to_le64(counter);
+    return true;
+}
+
+__always_inline static
+bool create_wg4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
+                       __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
 {
     struct iphdr *ip4h = pkt->data + iph_offset;
     __u16 udp_off = iph_offset + sizeof(*ip4h);
@@ -181,6 +200,9 @@ bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
     udph->dest = tuple->ipv4.dport;
     udph->len = bpf_htons(udp_len);
 
+    if (!push_wg_header(udph + 1, pkt->data_end, key_idx, counter))
+        return false;
+
     if (!config.udp_nocheck) {
         udph->check = udp_v4_checksum(pkt, iph_offset + sizeof(*ip4h), udp_len,
                                 ip4h->saddr, ip4h->daddr);
@@ -194,7 +216,8 @@ bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
 }
 
 __always_inline static
-bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple, __u8 iph_offset, __u16 tot_len)
+bool create_wg6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
+                       __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
 {
     struct ipv6hdr *ip6h = pkt->data + iph_offset;
     __u16 udp_off = iph_offset + sizeof(*ip6h);
@@ -221,6 +244,9 @@ bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple, _
     udph->dest = tuple->ipv6.dport;
     udph->len = payload_len;
 
+    if (!push_wg_header(udph + 1, pkt->data_end, key_idx, counter))
+        return false;
+
     udph->check = udp_v6_checksum(pkt, iph_offset + sizeof(*ip6h), udp_len,
                             &ip6h->saddr, &ip6h->daddr);
     if (!udph->check) {
@@ -232,11 +258,11 @@ bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple, _
 }
 
 __always_inline static
-bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family,
-                struct bpf_sock_tuple *tuple, __u8 iph_offset, __u16 tot_len)
+bool create_wg_tunnel(struct packet_data *pkt, sa_family_t family, struct bpf_sock_tuple *tuple,
+                      __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
 {
-    return family == AF_INET ? create_udp4_tunnel(pkt, tuple, iph_offset, tot_len):
-                               create_udp6_tunnel(pkt, tuple, iph_offset, tot_len);
+    return family == AF_INET ? create_wg4_tunnel(pkt, tuple, iph_offset, tot_len, key_idx, counter):
+                               create_wg6_tunnel(pkt, tuple, iph_offset, tot_len, key_idx, counter);
 }
 
 
