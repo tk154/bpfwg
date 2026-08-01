@@ -117,87 +117,115 @@ memory passed from the BPF program to the kernel.
 
 ### WireGuard Device Lookup
 
-```c
-struct wg_device *bpf_xdp_wg_device_get_by_index(struct xdp_md *xdp_ctx,
-                                                 __u32 ifindex);
-struct wg_device *bpf_skb_wg_device_get_by_index(struct __sk_buff *skb_ctx,
-                                                 __u32 ifindex);
-```
+#### `struct wg_device *bpf_xdp_wg_device_get_by_index(struct xdp_md *xdp_ctx, __u32 ifindex)`<br>`struct wg_device *bpf_skb_wg_device_get_by_index(struct __sk_buff *skb_ctx, __u32 ifindex)`
 
-Acquire the WireGuard device for an interface index. The encrypt path uses this
-after `bpf_fib_lookup()` identifies the WireGuard output interface.
+- **Parameters:**
+  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
+  - `ifindex`: Network interface index.
+- **Returns:** Pointer to a `wg_device` or `NULL` if not found.
+- **Description:**  
+  Acquire the WireGuard device for an interface index. The encrypt path uses this
+  after `bpf_fib_lookup()` identifies the WireGuard output interface. Must be
+  released before the program exits with
+  [`bpf_wg_device_put`](#void-bpf_wg_device_putstruct-wg_device-wg).
 
-```c
-struct wg_device *bpf_xdp_wg_device_get_by_port(struct xdp_md *xdp_ctx,
-                                                __u16 port);
-struct wg_device *bpf_skb_wg_device_get_by_port(struct __sk_buff *skb_ctx,
-                                                __u16 port);
-```
+#### `struct wg_device *bpf_xdp_wg_device_get_by_port(struct xdp_md *xdp_ctx, __u16 port)`<br>`struct wg_device *bpf_skb_wg_device_get_by_port(struct __sk_buff *skb_ctx, __u16 port)`
 
-Acquire the WireGuard device bound to a UDP listen port. The decrypt path uses
-this for incoming WireGuard data packets.
+- **Parameters:**
+  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
+  - `port`: WireGuard UDP listen port.
+- **Returns:** Pointer to a `wg_device` or `NULL` if not found.
+- **Description:**  
+  Acquire the WireGuard device bound to a UDP listen port. The decrypt path uses
+  this for incoming WireGuard data packets. Must be released before the program
+  exits with
+  [`bpf_wg_device_put`](#void-bpf_wg_device_putstruct-wg_device-wg).
 
 ### Peer Lookup
 
-```c
-struct wg_peer *bpf_wg_peer_allowedips_lookup(struct wg_device *wg,
-                                              const void *addr,
-                                              __u32 addr__sz);
-```
+#### `struct wg_peer *bpf_wg_peer_allowedips_lookup(struct wg_device *wg, const void *addr, __u32 addr__sz)`
 
-Look up the peer selected by WireGuard AllowedIPs. The encrypt path uses the
-inner destination address; the decrypt path uses the plaintext source address to
-validate that the packet belongs to the decrypted peer.
+- **Parameters:**
+  - `wg`: WireGuard device reference.
+  - `addr`: IPv4/IPv6 address pointer.
+  - `addr__sz`: Size of the address, 4 for IPv4 or 16 for IPv6.
+- **Returns:** Pointer to a `wg_peer` or `NULL` if not found.
+- **Description:**  
+  Look up the peer selected by WireGuard AllowedIPs for the supplied plaintext IP
+  address. The encrypt path uses the inner destination address; the decrypt path
+  uses the plaintext source address to validate that the packet belongs to the
+  decrypted peer. Must be released before the program exits with
+  [`bpf_wg_peer_put`](#void-bpf_wg_peer_putstruct-wg_peer-peer).
 
-```c
-struct wg_peer *bpf_wg_peer_hashtable_lookup(struct wg_device *wg, __le32 idx);
-```
+#### `struct wg_peer *bpf_wg_peer_hashtable_lookup(struct wg_device *wg, __le32 idx)`
 
-Look up a peer from the receiver index in an incoming WireGuard data header.
+- **Parameters:**
+  - `wg`: WireGuard device reference.
+  - `idx`: Receiver index from the incoming WireGuard data header.
+- **Returns:** Pointer to a `wg_peer` or `NULL` if not found.
+- **Description:**  
+  Look up a peer from the receiver index in an incoming WireGuard data header.
+  Must be released before the program exits with
+  [`bpf_wg_peer_put`](#void-bpf_wg_peer_putstruct-wg_peer-peer).
 
 ### Endpoint Lookup
 
-```c
-int bpf_wg_endpoint_tuple_get(struct wg_peer *peer,
-                              struct bpf_sock_tuple *tuple,
-                              __u32 tuple__sz);
-```
+#### `int bpf_wg_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple, __u32 tuple__sz)`
 
-Read the current UDP endpoint tuple for a peer. The encrypt path uses this tuple
-to build the outer UDP tunnel header.
+- **Parameters:**
+  - `peer`: WireGuard peer reference.
+  - `tuple`: Output buffer for the current UDP endpoint tuple.
+  - `tuple__sz`: Size of `tuple`.
+- **Returns:** Address family, `AF_INET` or `AF_INET6`, on success; negative error code otherwise.
+- **Description:**  
+  Read the current UDP endpoint tuple for a peer. The encrypt path uses this
+  tuple to build the outer UDP tunnel header.
 
 ### Encryption And Decryption
 
-```c
-int bpf_xdp_wg_encrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length,
-                       struct wg_peer *peer);
-int bpf_skb_wg_encrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length,
-                       struct wg_peer *peer);
-```
+#### `int bpf_xdp_wg_encrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`<br>`int bpf_skb_wg_encrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`
 
-Encrypt packet data in-place with the peer sending key. The BPF program prepares
-packet headroom/trailer space first, then passes the WireGuard header offset and
-WireGuard message length to the kfunc.
+- **Parameters:**
+  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
+  - `offset`: WireGuard header offset.
+  - `length`: WireGuard message length.
+  - `peer`: WireGuard peer reference.
+- **Returns:** `0` on success, negative error code otherwise.
+- **Description:**  
+  Encrypt packet data in-place with the peer sending key. The BPF program
+  prepares packet headroom/trailer space first, then passes the WireGuard header
+  offset and WireGuard message length to the kfunc.
 
-```c
-int bpf_xdp_wg_decrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length,
-                       struct wg_peer *peer);
-int bpf_skb_wg_decrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length,
-                       struct wg_peer *peer);
-```
+#### `int bpf_xdp_wg_decrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`<br>`int bpf_skb_wg_decrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`
 
-Decrypt packet data in-place with the peer receiving key. The kfunc validates the
-Poly1305 tag and WireGuard receive counter before the BPF program parses the
-inner plaintext IP packet.
+- **Parameters:**
+  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
+  - `offset`: WireGuard header offset.
+  - `length`: WireGuard message length.
+  - `peer`: WireGuard peer reference.
+- **Returns:** `0` on success, negative error code otherwise.
+- **Description:**  
+  Decrypt packet data in-place with the peer receiving key. The kfunc validates
+  the Poly1305 tag and WireGuard receive counter before the BPF program parses
+  the inner plaintext IP packet.
 
 ### Reference Release
 
-```c
-void bpf_wg_device_put(struct wg_device *wg);
-void bpf_wg_peer_put(struct wg_peer *peer);
-```
+#### `void bpf_wg_device_put(struct wg_device *wg)`
 
-Release references acquired by the device and peer lookup helpers.
+- **Parameters:**
+  - `wg`: WireGuard device reference acquired by a device lookup helper.
+- **Returns:** Nothing.
+- **Description:**  
+  Release a previously acquired WireGuard device reference.
+
+#### `void bpf_wg_peer_put(struct wg_peer *peer)`
+
+- **Parameters:**
+  - `peer`: WireGuard peer reference acquired by a peer lookup helper.
+- **Returns:** Nothing.
+- **Description:**  
+  Release a previously acquired WireGuard peer reference.
 
 ## Program Flow
 
