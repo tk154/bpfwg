@@ -1,16 +1,18 @@
 #ifndef MATCH_PORT_H
 #define MATCH_PORT_H
 
-#define PORT_BASE 5200
+#define SOURCE_BASE 5000
+#define DEST_BASE   5200
+
 
 SEC("xdp")
 int match_port(struct xdp_md *xdp) {
     void *data_end = (void *)(long)xdp->data_end;
     void *data = (void *)(long)xdp->data;
+    __u32 cpu, key;
     __be16 h_proto;
     __u8 l4_proto;
     __u16 dport;
-    __u32 cpu;
 
     h_proto = check_l2_header(&data, data_end);
     switch (h_proto) {
@@ -43,7 +45,9 @@ int match_port(struct xdp_md *xdp) {
             return XDP_PASS;
     }
 
-    cpu = rss_lookup_cpu(dport - PORT_BASE);
+    key = dport - (dport < DEST_BASE ? SOURCE_BASE : DEST_BASE);
+    cpu = rss_lookup_cpu(key);
+
     return bpf_redirect_map(&BPFWG_RSS_CPU_MAP, cpu, XDP_ABORTED);
 }
 

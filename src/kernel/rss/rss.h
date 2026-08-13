@@ -61,3 +61,4 @@ __be16 check_l2_header(void **data, void *data_end)
 #include "match_port.h"
 #include "tuple_steering.h"
 #include "rx_hash.h"
+#include "fnv_1a.h"
