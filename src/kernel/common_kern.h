@@ -30,6 +30,8 @@
 
 #define __push_eth_header(eth, pkt, fib) \
     do { \
+        /* Force the compiler to not optimize out of bounds check */ \
+        asm volatile("" : "+r"(eth)); \
         if ((void *)(eth + 1) > pkt->data_end) \
             return -1; \
         memcpy(eth->h_dest, fib->dmac, ETH_ALEN); \
@@ -83,6 +85,47 @@ struct packet_header {
 int bpf_dynptr_from_xdp(struct xdp_md *xdp, __u64 flags, struct bpf_dynptr *ptr) __ksym;
 int bpf_dynptr_from_skb(struct __sk_buff *skb, __u64 flags, struct bpf_dynptr *ptr) __ksym;
 int bpf_dynptr_adjust(const struct bpf_dynptr *p, __u64 start, __u64 end) __ksym;
+
+__always_inline static
+bool bpf_dynptr_from_packet(struct bpf_dynptr *ptr, struct packet_data *pkt,
+                            __u32 offset, __u32 length)
+{
+    int ret;
+
+    ret = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, ptr):
+        bpf_dynptr_from_skb(pkt->ctx, 0, ptr);
+
+    if (ret) {
+        bpf_printk("bpf_dynptr_from_xdp/sbk: %d", ret);
+        return false;
+    }
+
+    ret = bpf_dynptr_adjust(ptr, offset, offset + length);
+    if (ret) {
+        bpf_printk("bpf_dynptr_adjust: %d", ret);
+        return false;
+    }
+
+    return true;
+}
+
+__always_inline static
+bool bpf_skb_linearize(struct packet_data *pkt)
+{
+    struct __sk_buff *skb = (struct __sk_buff *)pkt->ctx;
+    int ret;
+
+    ret = bpf_skb_pull_data(skb, skb->len);
+    if (ret) {
+        bpf_printk("bpf_skb_pull_data: %d", ret);
+        return false;
+    }
+
+    pkt->data = (void *)(long)skb->data;
+    pkt->data_end = (void *)(long)skb->data_end;
+    return true;
+}
+
 
 __always_inline static
 bool bpf_xdp_adjust_packet(struct packet_data *pkt, int head, int tail)

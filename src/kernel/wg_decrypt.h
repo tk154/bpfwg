@@ -63,21 +63,15 @@ enum wg_action wg_decrypt_packet(struct packet_data *pkt, struct wg_decrypt_layo
     struct bpf_dynptr ptr;
     long ret;
 
-    ret = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
-        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
+    if (!pkt->is_xdp) {
+        if (!bpf_skb_linearize(pkt))
+            return WG_ACTION_DROP;
 
-    if (ret) {
-        bpf_printk("bpf_dynptr_from_xdp/skb: %d", ret);
-        return WG_ACTION_DROP;
+        pkt->p = pkt->data + layout->payload_offset;
     }
 
-    ret = bpf_dynptr_adjust(&ptr, layout->payload_offset,
-            layout->payload_offset + layout->payload_len);
-
-    if (ret) {
-        bpf_printk("bpf_dynptr_adjust: %d", ret);
+    if (!bpf_dynptr_from_packet(&ptr, pkt, layout->payload_offset, layout->payload_len))
         return WG_ACTION_DROP;
-    }
 
     ret = bpf_wg_decrypt(&ptr, keypair, nonce);
     switch (ret) {

@@ -124,21 +124,8 @@ enum wg_action wg_encrypt_packet(struct packet_data *pkt, struct wg_encrypt_layo
     struct bpf_dynptr ptr;
     long ret;
 
-    ret = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
-        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
-
-    if (ret) {
-        bpf_printk("bpf_dynptr_from_xdp/sbk: %d", ret);
+    if (!bpf_dynptr_from_packet(&ptr, pkt, layout->wg_offset, layout->wg_len))
         return WG_ACTION_DROP;
-    }
-
-    ret = bpf_dynptr_adjust(&ptr, layout->wg_offset,
-            layout->wg_offset + layout->wg_len);
-
-    if (ret) {
-        bpf_printk("bpf_dynptr_adjust: %d", ret);
-        return WG_ACTION_DROP;
-    }
 
     ret = bpf_wg_encrypt(&ptr, peer, nonce);
     if (ret >= 0) {

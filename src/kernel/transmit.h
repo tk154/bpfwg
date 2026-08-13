@@ -78,7 +78,6 @@ __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __s64 sum)
 {
     struct bpf_dynptr ptr;
     struct udphdr *udph;
-    int err;
 
     udph = pkt->data + offset;
     if ((void *)(udph + 1) > pkt->data_end)
@@ -89,13 +88,9 @@ __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __s64 sum)
     sum += IPPROTO_UDP << 8;
     sum += udph->len;
 
-    err = pkt->is_xdp ? bpf_dynptr_from_xdp(pkt->ctx, 0, &ptr):
-        bpf_dynptr_from_skb(pkt->ctx, 0, &ptr);
-
-    if (err)
+    if (!bpf_dynptr_from_packet(&ptr, pkt, offset, len))
         return 0;
 
-    bpf_dynptr_adjust(&ptr, offset, offset + len);
     sum = bpf_dynptr_checksum(&ptr, sum);
     if (sum < 0)
         return 0;
