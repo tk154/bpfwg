@@ -11,33 +11,33 @@
 static void empty_signal_handler(int signal) {}
 
 int main(int argc, char *argv[]) {
-    struct bpf_handle *bpf;
     struct bpfwg_dsa_attach dsa_attach = {};
-    char **attach_ifaces;
     unsigned int attach_ifaces_count;
+    int rc, ret = EXIT_FAILURE;
     bool dsa_enabled = false;
-    int ret = EXIT_FAILURE;
-    int rc;
-    struct cmd_args args = { 0 };
+    struct bpf_handle *bpf;
+    char **attach_ifaces;
+    struct cmd_args args;
 
     rc = check_cmd_args(argc, argv, &args);
-    if (rc == BPFWG_RC_HELP) {
+    if (rc == BPFWG_RC_OTHER) {
         ret = EXIT_SUCCESS;
         goto out;
     }
     if (rc != BPFWG_RC_OK)
         goto out;
 
-    attach_ifaces = args.ifaces;
-    attach_ifaces_count = args.ifaces_count;
-
-    if (bpfwg_dsa_prepare(args.ifaces, args.ifaces_count, args.dsa,
+    if (args.dsa && bpfwg_dsa_prepare(args.ifaces, args.ifaces_count, args.dsa,
             &args.dsa_config, &dsa_attach, &dsa_enabled) != BPFWG_RC_OK)
         goto out;
 
     if (dsa_enabled) {
         attach_ifaces = dsa_attach.ifaces;
         attach_ifaces_count = dsa_attach.ifaces_count;
+    }
+    else {
+        attach_ifaces = args.ifaces;
+        attach_ifaces_count = args.ifaces_count;
     }
 
     bpfwg_info("Init BPF object and setting config ...\n");
@@ -56,7 +56,7 @@ int main(int argc, char *argv[]) {
     if (args.rss_prog_name) {
         bpfwg_info("Init BPF RSS ...\n");
 
-        if (bpf_init_rss(bpf, args.rss_prog_name, &args.rss_excluded_cpus) != BPFWG_RC_OK)
+        if (bpf_init_rss(bpf, args.rss_prog_name, &args.rss_excluded_cpus, args.rss_only) != BPFWG_RC_OK)
             goto bpf_destroy;
     }
 

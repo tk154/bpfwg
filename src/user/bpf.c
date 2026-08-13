@@ -44,6 +44,7 @@ struct bpf_handle {
     __u32 cpu_count;
     bool dsa_enabled;
     bool rss_enabled;
+    bool rss_only;
     bool rss_prepared;
     bool obj_loaded;
 };
@@ -233,12 +234,18 @@ static int bpf_build_allowed_cpus(struct bpf_handle *bpf) {
     return BPFWG_RC_OK;
 }
 
-static int bpf_prepare_cpu_map(struct bpf_object *obj, __u32 cpu_count) {
+static int bpf_prepare_cpu_map(struct bpf_object *obj, __u32 cpu_count, bool rss_only) {
     struct bpf_map *cpu_map;
 
     cpu_map = bpf_object__find_map_by_name(obj, BPFWG_RSS_CPU_MAP_NAME);
     if (!cpu_map) {
         bpfwg_error("Error: Couldn't find BPF map %s.\n", BPFWG_RSS_CPU_MAP_NAME);
+        return BPFWG_RC_ERR;
+    }
+
+    if (rss_only && bpf_map__set_value_size(cpu_map, sizeof(__u32)) != 0) {
+        bpfwg_error("Error setting %s value size: %s (-%d).\n",
+            BPFWG_RSS_CPU_MAP_NAME, strerror(errno), errno);
         return BPFWG_RC_ERR;
     }
 
@@ -278,25 +285,29 @@ static int bpf_prepare_main_object(struct bpf_handle *bpf) {
         return bpf_set_programs_autoload(bpf->obj, BPFWG_XDP_PROG_NAME,
             BPFWG_TC_PROG_NAME);
 
-    if (bpf_set_programs_autoload(bpf->obj, BPFWG_XDP_CPUMAP_PROG_NAME, NULL)
-            != BPFWG_RC_OK)
-        return BPFWG_RC_ERR;
+    if (!bpf->rss_only) {
+        if (bpf_set_programs_autoload(bpf->obj, BPFWG_XDP_CPUMAP_PROG_NAME, NULL)
+                != BPFWG_RC_OK)
+            return BPFWG_RC_ERR;
 
-    cpumap_prog = bpf_object__find_program_by_name(bpf->obj,
-        BPFWG_XDP_CPUMAP_PROG_NAME);
-    if (!cpumap_prog) {
-        bpfwg_error("Error finding BPF program %s: %s (-%d).\n",
-            BPFWG_XDP_CPUMAP_PROG_NAME, strerror(errno), errno);
-        return BPFWG_RC_ERR;
+        cpumap_prog = bpf_object__find_program_by_name(bpf->obj,
+            BPFWG_XDP_CPUMAP_PROG_NAME);
+        if (!cpumap_prog) {
+            bpfwg_error("Error finding BPF program %s: %s (-%d).\n",
+                BPFWG_XDP_CPUMAP_PROG_NAME, strerror(errno), errno);
+            return BPFWG_RC_ERR;
+        }
+
+        if (bpf_program__set_expected_attach_type(cpumap_prog, BPF_XDP_CPUMAP) != 0) {
+            bpfwg_error("Couldn't set expected attach type 'BPF_XDP_CPUMAP' for BPF program %s: %s (-%d).\n",
+                BPFWG_XDP_CPUMAP_PROG_NAME, strerror(errno), errno);
+            return BPFWG_RC_ERR;
+        }
     }
-
-    if (bpf_program__set_expected_attach_type(cpumap_prog, BPF_XDP_CPUMAP) != 0) {
-        bpfwg_error("Couldn't set expected attach type 'BPF_XDP_CPUMAP' for BPF program %s: %s (-%d).\n",
-            BPFWG_XDP_CPUMAP_PROG_NAME, strerror(errno), errno);
+    else if (bpf_set_programs_autoload(bpf->obj, NULL, NULL) != BPFWG_RC_OK)
         return BPFWG_RC_ERR;
-    }
 
-    if (bpf_prepare_cpu_map(bpf->obj, bpf->cpu_count) != BPFWG_RC_OK)
+    if (bpf_prepare_cpu_map(bpf->obj, bpf->cpu_count, bpf->rss_only) != BPFWG_RC_OK)
         return BPFWG_RC_ERR;
 
     return bpf_set_rss_config(bpf->obj, bpf);
@@ -315,7 +326,7 @@ static int bpf_populate_cpu_map(struct bpf_handle *bpf) {
     }
 
     memset(&cpu_map_val, 0, sizeof(cpu_map_val));
-    cpu_map_val.bpf_prog.fd = bpf->cpumap_prog_fd;
+    cpu_map_val.bpf_prog.fd = !bpf->rss_only ? bpf->cpumap_prog_fd : 0;
     cpu_map_val.qsize = BPFWG_RSS_CPU_MAP_QUEUE_SIZE;
 
     for (i = 0; i < bpf->allowed_cpu_count; i++) {
@@ -389,11 +400,13 @@ static int bpf_load_object(struct bpf_handle *bpf) {
     bpf->obj_loaded = true;
 
     if (bpf->rss_enabled) {
-        bpf->cpumap_prog_fd = bpf_get_program_fd(bpf->obj,
-            BPFWG_XDP_CPUMAP_PROG_NAME);
+        if (!bpf->rss_only) {
+            bpf->cpumap_prog_fd = bpf_get_program_fd(bpf->obj,
+                BPFWG_XDP_CPUMAP_PROG_NAME);
 
-        if (bpf->cpumap_prog_fd < 0)
-            return BPFWG_RC_ERR;
+            if (bpf->cpumap_prog_fd < 0)
+                return BPFWG_RC_ERR;
+        }
 
         if (bpf_populate_cpu_map(bpf) != BPFWG_RC_OK)
             return BPFWG_RC_ERR;
@@ -581,7 +594,7 @@ static int bpf_ifindex_prepare_rss(struct bpf_handle *bpf, struct bpf_rss_progra
         return BPFWG_RC_ERR;
     }
 
-    if (bpf_prepare_cpu_map(rss->obj, bpf->cpu_count) != BPFWG_RC_OK)
+    if (bpf_prepare_cpu_map(rss->obj, bpf->cpu_count, bpf->rss_only) != BPFWG_RC_OK)
         return BPFWG_RC_ERR;
 
     if (bpf_set_rss_config(rss->obj, bpf) != BPFWG_RC_OK)
@@ -734,7 +747,7 @@ void bpf_detach_program(struct bpf_handle *bpf, enum bpf_hook hook, char *ifaces
 }
 
 int bpf_init_rss(struct bpf_handle *bpf, const char *rss_prog_name,
-                 const struct bpfwg_cpu_list *excluded_cpus) {
+                 const struct bpfwg_cpu_list *excluded_cpus, bool rss_only) {
     if (bpf->obj_loaded) {
         bpfwg_error("RSS mode must be enabled before loading the BPF object.\n");
         return BPFWG_RC_ERR;
@@ -750,6 +763,7 @@ int bpf_init_rss(struct bpf_handle *bpf, const char *rss_prog_name,
         return BPFWG_RC_ERR;
 
     bpf->rss_enabled = true;
+    bpf->rss_only = rss_only;
     bpf->rss_prog_name = rss_prog_name;
 
     return BPFWG_RC_OK;

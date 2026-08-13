@@ -30,9 +30,9 @@ static void print_usage(const char *prog, FILE *out) {
     fprintf(out, "  xdpoffload         Attach XDP in hardware offload mode.\n\n");
 
     fprintf(out, "Options:\n");
-    fprintf(out, "  -?, -h, --help                 Show this help text and exit.\n");
+    fprintf(out, "  -h, --help                     Show this help text and exit.\n");
     fprintf(out, "  -c, --conntrack                Require conntrack entries before redirecting packets.\n");
-    fprintf(out, "  -d, --dsa                      Require DSA discovery and attach to the conduit.\n");
+    fprintf(out, "  -d, --dsa                      Attempt DSA discovery and attach to the conduit.\n");
     fprintf(out, "  -e, --exclude-cpus LIST        Exclude CPUs from RSS targets, e.g. 0,1,4-7.\n");
     fprintf(out, "  -l, --log-level LEVEL          Set log level: error, warning, info, debug, verbose.\n");
     fprintf(out, "                                  Default: info.\n");
@@ -40,16 +40,14 @@ static void print_usage(const char *prog, FILE *out) {
     fprintf(out, "  -r, --rss PROGRAM              Enable XDP cpumap RSS with the selected program.\n");
     fprintf(out, "                                  Common values: round_robin, match_port,\n");
     fprintf(out, "                                  tuple_steering, rx_hash.\n");
+    fprintf(out, "  -R, --rss-only PROGRAM         Only perform RSS steering, passing packets to the network stack\n");
+    fprintf(out, "                                  without WireGuard XDP processing.\n");
     fprintf(out, "  -u, --udp                      Disable IPv4 UDP tunnel checksum calculation.\n\n");
 
     fprintf(out, "Examples:\n");
     fprintf(out, "  %s tc eth0 -o src/kernel/obj/wg_le.o\n", prog);
     fprintf(out, "  %s xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0\n", prog);
     fprintf(out, "  %s xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp\n", prog);
-}
-
-static bool is_help_arg(const char *arg) {
-    return !strcmp(arg, "-?") || !strcmp(arg, "-h") || !strcmp(arg, "--help");
 }
 
 static enum bpf_hook parse_hook(char* prog_hook) {
@@ -195,18 +193,12 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
         { "log-level",    required_argument, 0, 'l' },
         { "object",       required_argument, 0, 'o' },
         { "rss",          required_argument, 0, 'r' },
+        { "rss-only",     required_argument, 0, 'R' },
         { "udp",          no_argument,       0, 'u' },
         { 0,              0,                 0,  0  }
     };
 
-    for (i = 1; i < argc; i++) {
-        if (is_help_arg(argv[i])) {
-            print_usage(argv[0], stdout);
-            return BPFWG_RC_HELP;
-        }
-    }
-
-    while ((opt = getopt_long(argc, argv, "cde:hl:o:r:u?", options, &opt_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cde:hl:o:r:R:u?", options, &opt_index)) != -1) {
         switch (opt) {
             case 'c':
                 args->config.conntrack = true;
@@ -223,7 +215,7 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
 
             case 'h':
                 print_usage(argv[0], stdout);
-                return BPFWG_RC_HELP;
+                return BPFWG_RC_OTHER;
 
             case 'l':
                 if (!parse_log_level(optarg))
@@ -236,6 +228,11 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
 
             case 'r':
                 args->rss_prog_name = optarg;
+            break;
+
+            case 'R':
+                args->rss_prog_name = optarg;
+                args->rss_only = true;
             break;
 
             case 'u':
@@ -283,6 +280,7 @@ int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     args->rss_excluded_cpus.count = 0;
 
     args->dsa = false;
+    args->rss_only = false;
     args->config.conntrack = false;
     args->config.udp_nocheck = false;
     memset(&args->dsa_config, 0, sizeof(args->dsa_config));

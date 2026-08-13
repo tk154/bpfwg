@@ -7,9 +7,9 @@
 
 
 enum {
-    BPFWG_RC_ERR  = -1,
-    BPFWG_RC_OK   =  0,
-    BPFWG_RC_HELP =  1
+    BPFWG_RC_ERR   = -1,
+    BPFWG_RC_OK    =  0,
+    BPFWG_RC_OTHER =  1
 };
 
 struct bpfwg_cpu_list {

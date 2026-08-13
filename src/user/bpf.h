@@ -11,7 +11,7 @@ struct bpf_handle* bpf_init(const char* obj_path);
 void bpf_destroy(struct bpf_handle *bpf);
 
 int bpf_init_rss(struct bpf_handle *bpf, const char *rss_prog_name,
-                 const struct bpfwg_cpu_list *excluded_cpus);
+                 const struct bpfwg_cpu_list *excluded_cpus, bool rss_only);
 int bpf_set_config(struct bpf_handle *bpf, struct bpfwg_config *cfg);
 int bpf_set_dsa_config(struct bpf_handle *bpf, const struct bpfwg_dsa *cfg);
 
