@@ -187,8 +187,10 @@ int __tc_wg(struct __sk_buff *skb)
     int out_ifindex;
 
     out_ifindex = wg_process_packet(&pkt);
-    if (out_ifindex > 0)
+    if (out_ifindex > 0) {
+        bpf_set_hash_invalid(skb);
         return bpf_redirect(out_ifindex, 0);
+    }
     if (out_ifindex == 0)
         return TC_ACT_UNSPEC;
     return TC_ACT_SHOT;
