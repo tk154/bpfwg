@@ -21,6 +21,11 @@ struct bpf_rss_program {
     bool attached;
 };
 
+struct bpf_tc_link {
+    __u32 ifindex;
+    struct bpf_link *link;
+};
+
 struct bpf_handle {
     /* BPF object/program pointers */
     struct bpf_object *obj;
@@ -39,7 +44,10 @@ struct bpf_handle {
     /* BPF program file descriptors */
     int xdp_prog_fd;
     int cpumap_prog_fd;
-    int tc_prog_fd;
+    struct bpf_program *tc_prog;
+
+    struct bpf_tc_link *tc_links;
+    unsigned int tc_links_count;
 
     __u32 cpu_count;
     bool dsa_enabled;
@@ -280,6 +288,11 @@ static int bpf_set_rss_config(struct bpf_object *obj, const struct bpf_handle *b
 
 static int bpf_prepare_main_object(struct bpf_handle *bpf) {
     struct bpf_program *cpumap_prog;
+    struct bpf_program *tc_prog;
+
+    tc_prog = bpf_object__find_program_by_name(bpf->obj, BPFWG_TC_PROG_NAME);
+    if (tc_prog)
+        bpf_program__set_expected_attach_type(tc_prog, BPF_TCX_INGRESS);
 
     if (!bpf->rss_enabled)
         return bpf_set_programs_autoload(bpf->obj, BPFWG_XDP_PROG_NAME,
@@ -415,9 +428,9 @@ static int bpf_load_object(struct bpf_handle *bpf) {
     }
 
     bpf->xdp_prog_fd = bpf_get_program_fd(bpf->obj, BPFWG_XDP_PROG_NAME);
-    bpf->tc_prog_fd  = bpf_get_program_fd(bpf->obj, BPFWG_TC_PROG_NAME);
+    bpf->tc_prog = bpf_object__find_program_by_name(bpf->obj, BPFWG_TC_PROG_NAME);
 
-    if (bpf->xdp_prog_fd < 0 && bpf->tc_prog_fd < 0) {
+    if (bpf->xdp_prog_fd < 0 && !bpf->tc_prog) {
         bpfwg_error("XDP and TC program not found inside the BPF object file.\n");
         return BPFWG_RC_ERR;
     }
@@ -453,38 +466,48 @@ static void bpf_detach_xdp_program(struct bpf_handle *bpf, __u32 ifindex, enum b
 }
 
 static int bpf_attach_tc_program(struct bpf_handle *bpf, __u32 ifindex) {
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = bpf->tc_prog_fd);
-    libbpf_print_fn_t fn = libbpf_disable_messages();
-    int rc;
+    struct bpf_tc_link *new_links;
+    struct bpf_link *link;
 
-    // Create a TC hook on the ingress of the interface
-    // bpf_tc_hook_create will return an error and print an error message if the hook already exists
-    rc = bpf_tc_hook_create(&hook);
-    libbpf_enable_messages(fn);
-
-    if (rc != 0 && rc != -EEXIST) {
-        bpfwg_errno("Error creating TC hook", errno);
-        return BPFWG_RC_ERR;
-    }
-
-    // Attach the TC prgram to the created hook
-    if (bpf_tc_attach(&hook, &opts) != 0) {
-        bpfwg_error_ifindex("Error attaching TC program to ",
+    // Attach the program to the TCX hook
+    link = bpf_program__attach_tcx(bpf->tc_prog, ifindex, NULL);
+    if (!link) {
+        bpfwg_error_ifindex("Error attaching TCX program to ",
             ifindex, errno);
         return BPFWG_RC_ERR;
     }
 
-    bpfwg_debug_ifindex("  Attached TC hook to ", ifindex, 0);
+    new_links = (struct bpf_tc_link *)realloc(bpf->tc_links, (bpf->tc_links_count + 1) * sizeof(*new_links));
+    if (!new_links) {
+        bpfwg_error("Error allocating memory for TCX link: %s (-%d).\n", strerror(errno), errno);
+        bpf_link__destroy(link);
+        return BPFWG_RC_ERR;
+    }
+
+    bpf->tc_links = new_links;
+    bpf->tc_links[bpf->tc_links_count].ifindex = ifindex;
+    bpf->tc_links[bpf->tc_links_count].link = link;
+    bpf->tc_links_count++;
+
+    bpfwg_debug_ifindex("  Attached TCX hook to ", ifindex, 0);
 
     return BPFWG_RC_OK;
 }
 
 static void bpf_detach_tc_program(struct bpf_handle *bpf, __u32 ifindex) {
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
+    unsigned int i;
 
-    // Detach the TC prgram
-    bpf_tc_hook_destroy(&hook);
+    // Detach the TCX program
+    for (i = 0; i < bpf->tc_links_count; i++) {
+        if (bpf->tc_links[i].ifindex == ifindex) {
+            bpf_link__destroy(bpf->tc_links[i].link);
+
+            bpf->tc_links_count--;
+            if (i < bpf->tc_links_count)
+                bpf->tc_links[i] = bpf->tc_links[bpf->tc_links_count];
+            break;
+        }
+    }
 }
 
 
@@ -498,7 +521,7 @@ static int bpf_ifindex_attach_program(struct bpf_handle *bpf, __u32 ifindex, enu
         return bpf_attach_xdp_program(bpf, ifindex, hook);
     }
 
-    if (bpf->tc_prog_fd < 0) {
+    if (!bpf->tc_prog) {
         bpfwg_error("TC program not found inside the BPF object file.\n");
         return BPFWG_RC_ERR;
     }
@@ -819,7 +842,9 @@ struct bpf_handle* bpf_init(const char *obj_path) {
 
     bpf->xdp_prog_fd = -1;
     bpf->cpumap_prog_fd = -1;
-    bpf->tc_prog_fd = -1;
+    bpf->tc_prog = NULL;
+    bpf->tc_links = NULL;
+    bpf->tc_links_count = 0;
     bpf->cpu_count = 0;
 
     // Try to open the BPF object file, return on error
@@ -843,6 +868,7 @@ void bpf_destroy(struct bpf_handle* bpf) {
     bpf_object_close(bpf->obj);
     free(bpf->excluded_cpus.cpus);
     free(bpf->allowed_cpus);
+    free(bpf->tc_links);
 
     free(bpf);
 }

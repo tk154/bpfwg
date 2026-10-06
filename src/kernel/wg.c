@@ -209,7 +209,7 @@ int xdp_wg_cpumap(struct xdp_md *xdp)
     return __xdp_wg(xdp);
 }
 
-SEC("tc")
+SEC("tcx/ingress")
 int tc_wg(struct __sk_buff *skb)
 {
     if (skb->gso_size) {
