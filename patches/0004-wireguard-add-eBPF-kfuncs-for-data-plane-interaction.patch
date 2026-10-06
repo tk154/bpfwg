@@ -1,0 +1,830 @@
+From 2201aa53e0d8645dc0d003618631dd231ea69bcf Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Thu, 9 Jul 2026 21:37:33 +0200
+Subject: [PATCH 4/5] wireguard: add eBPF kfuncs for data plane interaction
+
+Introduce eBPF support for WireGuard by exposing a set of kfuncs that
+allow eBPF programs (XDP and SCHED_CLS) to directly interact with
+WireGuard internals.
+
+This commit introduces a new `bpf.c` file containing the kfunc
+definitions and registers them for both XDP and TC. The API is
+structured around the following capabilities:
+
+1. Device Lookup & Management:
+   - `bpf_{xdp,skb}_wg_device_get_by_index`: Retrieve a WireGuard device
+     reference (`struct wg_device`) using its interface index.
+   - `bpf_wg_device_get_from_sk`: Extract the associated WireGuard device
+     directly from a UDP socket (`struct sock`).
+   - `bpf_wg_device_put`: Release the acquired device reference.
+
+2. Peer & Keypair Lookup:
+   - `bpf_wg_peer_allowedips_lookup`: Look up a peer based on an IP address
+     (via the allowedips trie). This is primarily used to find the target peer
+     for outbound traffic.
+   - `bpf_wg_keypair_hashtable_lookup`: Look up a keypair by its receiver
+     index from the index hashtable, used for inbound encrypted packets.
+     Also returns the associated parent peer.
+   - `bpf_wg_peer_put`: Release the acquired peer reference.
+   - `bpf_wg_keypair_put`: Release the acquired keypair reference.
+
+3. Cryptography & Data Plane:
+   - `bpf_wg_encrypt` / `bpf_wg_decrypt`: Perform the actual Noise
+     protocol AEAD operations on the packet data. BPF programs interact with
+     this via dynptrs (`struct bpf_dynptr`). The memory bounds for encryption
+     and decryption are seamlessly extracted from the dynptr state (which can
+     be bounded by the BPF program using `bpf_dynptr_adjust`), removing the
+     need for offset/length arguments in the ABI. These functions also handle
+     validating Noise replay counters and keeping key fresh timers updated.
+   - `bpf_wg_endpoint_tuple_get`: Retrieve the outer IP endpoint routing
+     information for a peer, used to encapsulate packets.
+
+To bridge these BPF kfuncs with WireGuard's internal subsystems, several
+new helper functions were implemented (`wg_device_get_by_index`,
+`wg_socket_device_get_from_sk`, `wg_noise_counter_validate`,
+`wg_noise_receive_keep_key_fresh`, and `wg_noise_send_keep_key_fresh`).
+
+These functions wrap WireGuard's internal static functions to expose
+them to the BPF environment.
+
+Signed-off-by: Til Kaiser <mail@tk154.de>
+---
+ drivers/net/wireguard/Makefile     |   7 +
+ drivers/net/wireguard/allowedips.c |  11 +
+ drivers/net/wireguard/allowedips.h |   2 +
+ drivers/net/wireguard/bpf.c        | 480 +++++++++++++++++++++++++++++
+ drivers/net/wireguard/bpf.h        |  20 ++
+ drivers/net/wireguard/device.c     |  17 +
+ drivers/net/wireguard/device.h     |   3 +
+ drivers/net/wireguard/main.c       |   7 +
+ drivers/net/wireguard/netlink.c    |   2 +-
+ drivers/net/wireguard/noise.h      |   6 +
+ drivers/net/wireguard/receive.c    |   8 +-
+ drivers/net/wireguard/send.c       |   4 +-
+ drivers/net/wireguard/socket.c     |  16 +
+ drivers/net/wireguard/socket.h     |   3 +
+ 14 files changed, 579 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/net/wireguard/bpf.c
+ create mode 100644 drivers/net/wireguard/bpf.h
+
+diff --git a/drivers/net/wireguard/Makefile b/drivers/net/wireguard/Makefile
+index dbe1f8514efc..9b27f61ef5e1 100644
+--- a/drivers/net/wireguard/Makefile
++++ b/drivers/net/wireguard/Makefile
+@@ -14,4 +14,11 @@ wireguard-y += allowedips.o
+ wireguard-y += ratelimiter.o
+ wireguard-y += cookie.o
+ wireguard-y += netlink.o
++
++ifeq ($(CONFIG_WIREGUARD),m)
++wireguard-$(CONFIG_DEBUG_INFO_BTF_MODULES) += bpf.o
++else ifeq ($(CONFIG_WIREGUARD),y)
++wireguard-$(CONFIG_DEBUG_INFO_BTF) += bpf.o
++endif
++
+ obj-$(CONFIG_WIREGUARD) := wireguard.o
+diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
+index 09f7fcd7da78..e1581c54fd91 100644
+--- a/drivers/net/wireguard/allowedips.c
++++ b/drivers/net/wireguard/allowedips.c
+@@ -414,6 +414,17 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 	return NULL;
+ }
+ 
++/* Returns a strong reference to a peer */
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len)
++{
++	if (addr_len == 4)
++		return lookup(table->root4, 32, addr);
++	else if (addr_len == 16)
++		return lookup(table->root6, 128, addr);
++	return NULL;
++}
++
+ int __init wg_allowedips_slab_init(void)
+ {
+ 	node_cache = KMEM_CACHE(allowedips_node, 0);
+diff --git a/drivers/net/wireguard/allowedips.h b/drivers/net/wireguard/allowedips.h
+index 931958cb6e10..50c40f600b19 100644
+--- a/drivers/net/wireguard/allowedips.h
++++ b/drivers/net/wireguard/allowedips.h
+@@ -52,6 +52,8 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
+ 					 struct sk_buff *skb);
+ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 					 struct sk_buff *skb);
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len);
+ 
+ #ifdef DEBUG
+ bool wg_allowedips_selftest(void);
+diff --git a/drivers/net/wireguard/bpf.c b/drivers/net/wireguard/bpf.c
+new file mode 100644
+index 000000000000..cfc28d00ab53
+--- /dev/null
++++ b/drivers/net/wireguard/bpf.c
+@@ -0,0 +1,480 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/netdevice.h>
++#include <net/xdp.h>
++
++#include "bpf.h"
++#include "device.h"
++#include "peer.h"
++#include "socket.h"
++#include "timers.h"
++
++
++static struct wg_device *
++bpf_wg_device_get_by_index(struct net *caller_net, u32 ifindex, s32 netns_id,
++			   int *err)
++{
++	struct wg_device *wg;
++	struct net *net;
++
++	if (unlikely(!ifindex || netns_id < BPF_F_CURRENT_NETNS)) {
++		*err = -EINVAL;
++		return NULL;
++	}
++
++	if (netns_id >= 0) {
++		net = get_net_ns_by_id(caller_net, netns_id);
++		if (unlikely(!net)) {
++			*err = -ENOENT;
++			return NULL;
++		}
++
++		wg = wg_device_get_by_index(net, ifindex);
++		put_net(net);
++	} else {
++		net = caller_net;
++		wg = wg_device_get_by_index(net, ifindex);
++	}
++
++	if (unlikely(!wg)) {
++		*err = -ENODEV;
++		return NULL;
++	}
++
++	*err = 0;
++	return wg;
++}
++
++__bpf_kfunc_start_defs();
++
++/**
++ * bpf_xdp_wg_device_get_by_index() - Get wireguard device by ifindex.
++ * @xdp_ctx: XDP context pointer.
++ * @ifindex: Interface index.
++ * @netns_id: Network namespace ID or BPF_F_CURRENT_NETNS.
++ * @err: Pointer to error value.
++ *
++ * Retrieves a reference to the wireguard device associated with the given
++ * @ifindex from an XDP program. The device reference must be released using
++ * bpf_wg_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, with @err set to one of the following:
++ *   -EINVAL - @ifindex is zero or @netns_id is less than BPF_F_CURRENT_NETNS
++ *   -ENOENT - No network namespace found for @netns_id
++ *   -ENODEV - No wireguard device found for @ifindex
++ */
++__bpf_kfunc struct wg_device *
++bpf_xdp_wg_device_get_by_index(struct xdp_md *xdp_ctx, u32 ifindex, s32 netns_id, int *err)
++{
++	struct xdp_buff *ctx = (struct xdp_buff *)xdp_ctx;
++	struct net *caller_net = dev_net(ctx->rxq->dev);
++
++	return bpf_wg_device_get_by_index(caller_net, ifindex, netns_id, err);
++}
++
++/**
++ * bpf_skb_wg_device_get_by_index() - Get wireguard device by ifindex.
++ * @skb_ctx: SKB context pointer.
++ * @ifindex: Interface index.
++ * @netns_id: Network namespace ID or BPF_F_CURRENT_NETNS.
++ * @err: Pointer to error value.
++ *
++ * Retrieves a reference to the wireguard device associated with the given
++ * @ifindex from a TC or socket-related program. The device reference must
++ * be released using bpf_wg_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, with @err set to one of the following:
++ *   -EINVAL - @ifindex is zero or @netns_id is less than BPF_F_CURRENT_NETNS
++ *   -ENOENT - No network namespace found for @netns_id
++ *   -ENODEV - No wireguard device found for @ifindex
++ */
++__bpf_kfunc struct wg_device *
++bpf_skb_wg_device_get_by_index(struct __sk_buff *skb_ctx, u32 ifindex, s32 netns_id, int *err)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct net *caller_net;
++
++	caller_net = skb->dev ? dev_net(skb->dev) : sock_net(skb->sk);
++	return bpf_wg_device_get_by_index(caller_net, ifindex, netns_id, err);
++}
++
++/**
++ * bpf_wg_device_get_from_sk() - Get wireguard device from socket.
++ * @sk: Socket pointer.
++ *
++ * Retrieves a reference to the wireguard device associated with the given
++ * socket @sk. The device reference must be released using bpf_wg_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, if @sk is not a wireguard socket.
++ */
++__bpf_kfunc struct wg_device *
++bpf_wg_device_get_from_sk(struct sock *sk)
++{
++	return wg_socket_device_get_from_sk(sk);
++}
++
++/**
++ * bpf_wg_peer_allowedips_lookup() - Lookup wireguard peer by allowed IPs.
++ * @wg: Wireguard device pointer.
++ * @addr: IP address to lookup.
++ * @addr__sz: Size of @addr.
++ *
++ * Looks up a wireguard peer based on the provided IP address @addr. This is
++ * typically used to find the peer for outbound traffic before encrypting,
++ * but can also be used to check if the decrypted source IP is in the
++ * allowed IPs list. The returned peer reference must be released using
++ * bpf_wg_peer_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_peer on success.
++ * * NULL if the IP is not routed through the WireGuard device or the peer is dead.
++ */
++__bpf_kfunc struct wg_peer *
++bpf_wg_peer_allowedips_lookup(struct wg_device *wg, const void *addr,
++			      u32 addr__sz)
++{
++	struct wg_peer *peer;
++
++	peer = wg_allowedips_lookup_bpf(&wg->peer_allowedips, addr, addr__sz);
++	if (unlikely(!peer))
++		return NULL;
++
++	if (unlikely(READ_ONCE(peer->is_dead))) {
++		wg_peer_put(peer);
++		return NULL;
++	}
++
++	return peer;
++}
++
++/**
++ * bpf_wg_keypair_hashtable_lookup() - Lookup wireguard keypair by hashtable index.
++ * @wg: Wireguard device pointer.
++ * @key_idx: Key index in hashtable.
++ * @peer_addr: Pointer to be populated with the peer address.
++ *
++ * Looks up a wireguard peer and its current receiving keypair based on the
++ * receiver index @key_idx. This is typically used to find the decryption keys
++ * for inbound wireguard data packets. @peer_addr is populated with the peer
++ * address, which can be used to verify cryptokey routing by comparing it
++ * against the peer returned from bpf_wg_peer_allowedips_lookup().
++ * The returned keypair reference must be released using bpf_wg_keypair_put().
++ *
++ * Return:
++ * * Pointer to &struct noise_keypair on success.
++ * * NULL if no keypair was found or the peer is dead.
++ */
++__bpf_kfunc struct noise_keypair *
++bpf_wg_keypair_hashtable_lookup(struct wg_device *wg, __le32 key_idx,
++				unsigned long *peer_addr)
++{
++	struct noise_keypair *keypair;
++	struct wg_peer *peer = NULL;
++
++	rcu_read_lock_bh();
++	keypair = (struct noise_keypair *)wg_index_hashtable_lookup(
++		wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, key_idx, &peer);
++	keypair = wg_noise_keypair_get(keypair);
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair))
++		goto err_keypair;
++	if (unlikely(READ_ONCE(peer->is_dead)))
++		goto err;
++
++	*peer_addr = (unsigned long)peer;
++	return keypair;
++
++err:
++	wg_noise_keypair_put(keypair, false);
++err_keypair:
++	wg_peer_put(peer);
++	return NULL;
++}
++
++/**
++ * bpf_wg_endpoint_tuple_get() - Get wireguard endpoint tuple.
++ * @peer: Wireguard peer pointer.
++ * @tuple: Pointer to a bpf_sock_tuple to write to.
++ *
++ * Retrieves the socket tuple (source and destination IPs and ports) associated
++ * with the wireguard @bpf_peer's endpoint.
++ *
++ * Return:
++ * * Address family on success.
++ * * Error code on failure:
++ *   -EDESTADDRREQ - Endpoint address family is not AF_INET or AF_INET6
++ */
++__bpf_kfunc int
++bpf_wg_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple)
++{
++	u16 sport = htons(peer->device->incoming_port);
++	struct endpoint *endpoint = &peer->endpoint;
++	int ret;
++
++	read_lock_bh(&peer->endpoint_lock);
++	switch (endpoint->addr.sa_family) {
++	case AF_INET:
++		tuple->ipv4.daddr = endpoint->addr4.sin_addr.s_addr;
++		tuple->ipv4.dport = endpoint->addr4.sin_port;
++		tuple->ipv4.saddr = endpoint->src4.s_addr;
++		tuple->ipv4.sport = sport;
++		ret = AF_INET;
++		break;
++	case AF_INET6:
++		memcpy(tuple->ipv6.daddr, &endpoint->addr6.sin6_addr,
++		       sizeof(tuple->ipv6.daddr));
++		memcpy(tuple->ipv6.saddr, &endpoint->src6,
++		       sizeof(tuple->ipv6.saddr));
++		tuple->ipv6.dport = endpoint->addr6.sin6_port;
++		tuple->ipv6.sport = sport;
++		ret = AF_INET6;
++		break;
++	default:
++		ret = -EDESTADDRREQ;
++	}
++	read_unlock_bh(&peer->endpoint_lock);
++
++	return ret;
++}
++
++/**
++ * bpf_wg_encrypt() - Encrypt a wireguard packet.
++ * @ptr: Pointer to the bpf_dynptr containing the packet data.
++ * @peer: Wireguard peer pointer.
++ * @counter: Pointer to be populated with the used nonce counter.
++ *
++ * Encrypts the payload of the packet referenced by @ptr in-place using the
++ * current sending key from @peer's session. The exact bounds of the packet
++ * to encrypt are extracted natively from the provided dynptr. The incremented
++ * counter used as the nonce is returned in @counter.
++ *
++ * Return:
++ * * The remote_index (>= 0) on success.
++ * * Negative error code on failure:
++ *   -EINVAL
++ *     - The dynptr was not initialized correctly
++ *     - The dynptr is read-only
++ *     - The dynptr length is not a multiple of 16
++ *   -E2BIG - The dynptr length is out of bounds
++ *   -EOPNOTSUPP - The dynptr is not of type XDP or SKB
++ *   -EMSGSIZE - The packet exceeds the maximum allowed size or is too fragmented
++ *   -EKEYEXPIRED - The sending counter reached REJECT_AFTER_MESSAGES
++ *   -EBADMSG - The encryption operation failed
++ */
++__bpf_kfunc long
++bpf_wg_encrypt(struct bpf_dynptr *ptr, struct wg_peer *peer, u64 *counter)
++{
++	struct bpf_dynptr_kern *ptr_kern = (struct bpf_dynptr_kern *)ptr;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct noise_keypair *keypair;
++	size_t plaintext_len;
++	u32 length;
++	u64 nonce;
++	long ret;
++
++	if (unlikely(!ptr_kern->data || __bpf_dynptr_is_rdonly(ptr_kern)))
++		return -EINVAL;
++
++	length = __bpf_dynptr_size(ptr_kern);
++	if (unlikely(length <= noise_encrypted_len(0) ||
++			!IS_ALIGNED(length, MESSAGE_PADDING_MULTIPLE)))
++		return -EINVAL;
++
++	rcu_read_lock_bh();
++	keypair = wg_noise_keypair_get(
++		rcu_dereference_bh(peer->keypairs.current_keypair));
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair || !READ_ONCE(keypair->sending.is_valid))) {
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	if (unlikely(wg_birthdate_has_expired(keypair->sending.birthdate,
++					      REJECT_AFTER_TIME))) {
++		WRITE_ONCE(keypair->sending.is_valid, false);
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	nonce = atomic64_inc_return(&keypair->sending_counter) - 1;
++	if (unlikely(nonce >= REJECT_AFTER_MESSAGES)) {
++		WRITE_ONCE(keypair->sending.is_valid, false);
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	ret = bpf_dynptr_to_sgvec(ptr_kern, sg, ARRAY_SIZE(sg));
++	if (unlikely(ret < 0))
++		goto out;
++
++	plaintext_len = length - noise_encrypted_len(0);
++	if (unlikely(!chacha20poly1305_encrypt_sg_inplace(sg,
++			plaintext_len, NULL, 0, nonce, keypair->sending.key))) {
++		ret = -EBADMSG;
++		goto out;
++	}
++
++	wg_noise_send_keep_key_fresh(peer);
++	ret = (long)keypair->remote_index;
++	*counter = nonce;
++
++out:
++	wg_noise_keypair_put(keypair, false);
++	return ret;
++}
++
++/**
++ * bpf_wg_decrypt() - Decrypt a wireguard packet.
++ * @ptr: Pointer to the bpf_dynptr containing the packet data.
++ * @keypair: Wireguard keypair pointer.
++ * @counter: Nonce counter used for decryption.
++ *
++ * Decrypts the payload of the packet referenced by @ptr in-place using the
++ * provided @keypair. The exact bounds of the packet to decrypt are extracted
++ * natively from the provided dynptr. The @counter is used as the nonce and
++ * is checked if it is valid.
++ *
++ * Return:
++ * * 0 on success.
++ * * Error code on failure:
++ *   -EINVAL
++ *     - The dynptr was not initialized correctly
++ *     - The dynptr is read-only
++ *     - The SKB is cloned
++ *   -E2BIG - The dynptr length is out of bounds
++ *   -EOPNOTSUPP - The dynptr is not of type XDP or SKB
++ *   -EMSGSIZE - The packet exceeds the maximum allowed size or is too fragmented
++ *   -EBADMSG - The decryption operation failed
++ *   -EPROTO - The nonce counter validation failed
++ */
++__bpf_kfunc long
++bpf_wg_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair, u64 counter)
++{
++	struct bpf_dynptr_kern *ptr_kern = (struct bpf_dynptr_kern *)ptr;
++	struct wg_peer *peer = keypair->entry.peer;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	u32 length;
++	long ret;
++
++	if (unlikely(!ptr_kern->data || __bpf_dynptr_is_rdonly(ptr_kern)))
++		return -EINVAL;
++
++	length = __bpf_dynptr_size(ptr_kern);
++	if (unlikely(length <= noise_encrypted_len(0)))
++		return -EINVAL;
++
++	if (unlikely(!READ_ONCE(keypair->receiving.is_valid)))
++		return -EKEYEXPIRED;
++
++	if (unlikely(wg_birthdate_has_expired(keypair->receiving.birthdate,
++					      REJECT_AFTER_TIME) ||
++		     READ_ONCE(keypair->receiving_counter.counter) >=
++			     REJECT_AFTER_MESSAGES)) {
++		WRITE_ONCE(keypair->receiving.is_valid, false);
++		return -EKEYEXPIRED;
++	}
++
++	ret = bpf_dynptr_to_sgvec(ptr_kern, sg, ARRAY_SIZE(sg));
++	if (unlikely(ret < 0))
++		return ret;
++
++	if (unlikely(!chacha20poly1305_decrypt_sg_inplace(sg,
++		    length, NULL, 0, counter, keypair->receiving.key)))
++		return -EBADMSG;
++
++	if (unlikely(!wg_noise_counter_validate(&keypair->receiving_counter,
++						counter)))
++		return -EPROTO;
++
++	wg_noise_receive_keep_key_fresh(peer);
++	wg_timers_any_authenticated_packet_received(peer);
++	wg_timers_any_authenticated_packet_traversal(peer);
++	return 0;
++}
++
++/**
++ * bpf_wg_device_put() - Release wireguard device.
++ * @bpf_wg: Wireguard device pointer.
++ *
++ * Decrements the reference count of the wireguard device @bpf_wg previously
++ * acquired by a bpf_*_wg_device_get_* kfunc.
++ */
++__bpf_kfunc void
++bpf_wg_device_put(struct wg_device *wg)
++{
++	dev_put(wg->dev);
++}
++
++/**
++ * bpf_wg_peer_put() - Release wireguard peer.
++ * @bpf_peer: Wireguard peer pointer.
++ *
++ * Decrements the reference count of the wireguard peer @bpf_peer previously
++ * acquired by a bpf_wg_peer_*_lookup kfunc.
++ */
++__bpf_kfunc void
++bpf_wg_peer_put(struct wg_peer *peer)
++{
++	wg_peer_put(peer);
++}
++
++/**
++ * bpf_wg_keypair_put() - Release wireguard keypair.
++ * @keypair: Wireguard keypair pointer.
++ *
++ * Decrements the reference count of the wireguard keypair @keypair previously
++ * acquired by a bpf_wg_keypair_*_lookup and its belonging peer kfunc.
++ */
++__bpf_kfunc void
++bpf_wg_keypair_put(struct noise_keypair *keypair)
++{
++	struct wg_peer *peer = keypair->entry.peer;
++
++	wg_noise_keypair_put(keypair, false);
++	wg_peer_put(peer);
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(wg_kfunc_set)
++BTF_ID_FLAGS(func, bpf_xdp_wg_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_skb_wg_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_wg_device_get_from_sk,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_peer_allowedips_lookup,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_keypair_hashtable_lookup,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_endpoint_tuple_get, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_encrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_device_put, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_wg_peer_put, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_wg_keypair_put, KF_RELEASE)
++BTF_KFUNCS_END(wg_kfunc_set)
++
++static const struct btf_kfunc_id_set wireguard_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set = &wg_kfunc_set,
++};
++
++int __init register_wireguard_bpf(void)
++{
++	int ret;
++
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
++					&wireguard_kfunc_set);
++	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
++					&wireguard_kfunc_set);
++	return ret;
++}
+diff --git a/drivers/net/wireguard/bpf.h b/drivers/net/wireguard/bpf.h
+new file mode 100644
+index 000000000000..6a4abc6d0d9d
+--- /dev/null
++++ b/drivers/net/wireguard/bpf.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _WG_BPF_H
++#define _WG_BPF_H
++
++#if (IS_BUILTIN(CONFIG_WIREGUARD) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
++    (IS_MODULE(CONFIG_WIREGUARD) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
++
++extern int __init register_wireguard_bpf(void);
++
++#else
++
++static inline int __init register_wireguard_bpf(void)
++{
++	return 0;
++}
++
++#endif
++
++#endif /* _WG_BPF_H */
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index 67b07ee2d660..5db18a3327c9 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -473,3 +473,20 @@ void wg_device_uninit(void)
+ 	unregister_pm_notifier(&pm_notifier);
+ 	rcu_barrier();
+ }
++
++struct wg_device *
++wg_device_get_by_index(struct net *net, int ifindex)
++{
++	struct wg_device *wg = NULL;
++	struct net_device *dev;
++
++	rcu_read_lock();
++	dev = dev_get_by_index_rcu(net, ifindex);
++	if (dev && dev->netdev_ops == &netdev_ops) {
++		wg = netdev_priv(dev);
++		dev_hold(wg->dev);
++	}
++	rcu_read_unlock();
++
++	return wg;
++}
+diff --git a/drivers/net/wireguard/device.h b/drivers/net/wireguard/device.h
+index 43c7cebbf50b..9c48184abc32 100644
+--- a/drivers/net/wireguard/device.h
++++ b/drivers/net/wireguard/device.h
+@@ -59,4 +59,7 @@ struct wg_device {
+ int wg_device_init(void);
+ void wg_device_uninit(void);
+ 
++struct wg_device *
++wg_device_get_by_index(struct net *net, int ifindex);
++
+ #endif /* _WG_DEVICE_H */
+diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
+index a00671b58701..639fff975a12 100644
+--- a/drivers/net/wireguard/main.c
++++ b/drivers/net/wireguard/main.c
+@@ -9,6 +9,7 @@
+ #include "queueing.h"
+ #include "ratelimiter.h"
+ #include "netlink.h"
++#include "bpf.h"
+ 
+ #include <uapi/linux/wireguard.h>
+ 
+@@ -45,11 +46,17 @@ static int __init wg_mod_init(void)
+ 	if (ret < 0)
+ 		goto err_netlink;
+ 
++	ret = register_wireguard_bpf();
++	if (ret < 0)
++		goto err_bpf;
++
+ 	pr_info("WireGuard " WIREGUARD_VERSION " loaded. See www.wireguard.com for information.\n");
+ 	pr_info("Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.\n");
+ 
+ 	return 0;
+ 
++err_bpf:
++	wg_genetlink_uninit();
+ err_netlink:
+ 	wg_device_uninit();
+ err_device:
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index 67f962eb8b46..1cd45857bf6b 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -645,7 +645,7 @@ int __init wg_genetlink_init(void)
+ 	return genl_register_family(&genl_family);
+ }
+ 
+-void __exit wg_genetlink_uninit(void)
++void wg_genetlink_uninit(void)
+ {
+ 	genl_unregister_family(&genl_family);
+ }
+diff --git a/drivers/net/wireguard/noise.h b/drivers/net/wireguard/noise.h
+index c527253dba80..89485c87862a 100644
+--- a/drivers/net/wireguard/noise.h
++++ b/drivers/net/wireguard/noise.h
+@@ -132,4 +132,10 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
+ bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
+ 				      struct noise_keypairs *keypairs);
+ 
++bool wg_noise_counter_validate(struct noise_replay_counter *counter,
++					u64 their_counter);
++
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer);
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer);
++
+ #endif /* _WG_NOISE_H */
+diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
+index eb8851113654..50308d675ec2 100644
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -217,7 +217,7 @@ void wg_packet_handshake_receive_worker(struct work_struct *work)
+ 	}
+ }
+ 
+-static void keep_key_fresh(struct wg_peer *peer)
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer)
+ {
+ 	struct noise_keypair *keypair;
+ 	bool send;
+@@ -292,7 +292,7 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ }
+ 
+ /* This is RFC6479, a replay detection bitmap algorithm that avoids bitshifts */
+-static bool counter_validate(struct noise_replay_counter *counter, u64 their_counter)
++bool wg_noise_counter_validate(struct noise_replay_counter *counter, u64 their_counter)
+ {
+ 	unsigned long index, index_current, top, i;
+ 	bool ret = false;
+@@ -348,7 +348,7 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
+ 		wg_packet_send_staged_packets(peer);
+ 	}
+ 
+-	keep_key_fresh(peer);
++	wg_noise_receive_keep_key_fresh(peer);
+ 
+ 	wg_timers_any_authenticated_packet_received(peer);
+ 	wg_timers_any_authenticated_packet_traversal(peer);
+@@ -458,7 +458,7 @@ int wg_packet_rx_poll(struct napi_struct *napi, int budget)
+ 		if (unlikely(state != PACKET_STATE_CRYPTED))
+ 			goto next;
+ 
+-		if (unlikely(!counter_validate(&keypair->receiving_counter,
++		if (unlikely(!wg_noise_counter_validate(&keypair->receiving_counter,
+ 					       PACKET_CB(skb)->nonce))) {
+ 			net_dbg_ratelimited("%s: Packet has invalid nonce %llu (max %llu)\n",
+ 					    peer->device->dev->name,
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+index 67d01478eb76..ca00c1db7ab7 100644
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -121,7 +121,7 @@ void wg_packet_send_handshake_cookie(struct wg_device *wg,
+ 					      sizeof(packet));
+ }
+ 
+-static void keep_key_fresh(struct wg_peer *peer)
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer)
+ {
+ 	struct noise_keypair *keypair;
+ 	bool send;
+@@ -256,7 +256,7 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
+ 	if (likely(data_sent))
+ 		wg_timers_data_sent(peer);
+ 
+-	keep_key_fresh(peer);
++	wg_noise_send_keep_key_fresh(peer);
+ }
+ 
+ void wg_packet_tx_worker(struct work_struct *work)
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index 253488f8c00f..a91a7ecf28eb 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -435,3 +435,19 @@ void wg_socket_reinit(struct wg_device *wg, struct sock *new4,
+ 	sock_free(old4);
+ 	sock_free(old6);
+ }
++
++struct wg_device *wg_socket_device_get_from_sk(struct sock *sk)
++{
++	struct wg_device *wg;
++
++	if (READ_ONCE(udp_sk(sk)->encap_rcv) != wg_receive)
++		return NULL;
++
++	rcu_read_lock();
++	wg = rcu_dereference_sk_user_data(sk);
++	if (likely(wg))
++		dev_hold(wg->dev);
++	rcu_read_unlock();
++
++	return wg;
++}
+diff --git a/drivers/net/wireguard/socket.h b/drivers/net/wireguard/socket.h
+index bab5848efbcd..be74eb90af50 100644
+--- a/drivers/net/wireguard/socket.h
++++ b/drivers/net/wireguard/socket.h
+@@ -30,6 +30,9 @@ void wg_socket_set_peer_endpoint_from_skb(struct wg_peer *peer,
+ 					  const struct sk_buff *skb);
+ void wg_socket_clear_peer_endpoint_src(struct wg_peer *peer);
+ 
++struct wg_device *
++wg_socket_device_get_from_sk(struct sock *sk);
++
+ #if defined(CONFIG_DYNAMIC_DEBUG) || defined(DEBUG)
+ #define net_dbg_skb_ratelimited(fmt, dev, skb, ...) do {                       \
+ 		struct endpoint __endpoint;                                    \
+-- 
+2.55.0
+

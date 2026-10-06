@@ -1,0 +1,155 @@
+From 6268e1acfe154ca46c69a88f4f8f8362230aa1d7 Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Tue, 14 Apr 2026 13:39:08 +0200
+Subject: [PATCH 3/5] bpf, filter: add bpf_xdp_to_sgvec helper
+
+Introduce `bpf_xdp_to_sgvec()`, a helper function to convert an XDP
+buffer (`struct xdp_buff`) into a scatterlist (`struct scatterlist`).
+
+This is useful when XDP programs need to pass packet data to kernel
+subsystems that operate on scatterlists. The helper handles both the
+linear data portion of the XDP buffer as well as any attached page
+fragments (if the buffer is non-linear).
+
+Signed-off-by: Til Kaiser <mail@tk154.de>
+---
+ include/linux/bpf.h |   2 +
+ net/core/filter.c   | 109 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a9437596224f..6a13ad2b5abb 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1391,6 +1391,8 @@ int __bpf_dynptr_write(const struct bpf_dynptr_kern *dst, u32 offset,
+ 		       void *src, u32 len, u64 flags);
+ void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr *p, u32 offset,
+ 			    void *buffer__opt, u32 buffer__szk);
++int bpf_dynptr_to_sgvec(const struct bpf_dynptr_kern *ptr_kern,
++			struct scatterlist *sg, int sg_max_entries);
+ 
+ static inline int bpf_dynptr_check_off_len(const struct bpf_dynptr_kern *ptr, u32 offset, u32 len)
+ {
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 3f6ecd52d1d0..1323ecd234ec 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -12483,6 +12483,115 @@ int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
+ 	return 0;
+ }
+ 
++static int bpf_xdp_to_sgvec(struct xdp_buff *xdp, struct scatterlist *sg,
++			    u32 offset, u32 len)
++{
++	int start = xdp->data_end - xdp->data;
++	struct skb_shared_info *sinfo;
++	int i, copy = start - offset;
++	int elt = 0;
++
++	/* Linear part in xdp->data..data_end */
++	if (copy > 0) {
++		if (copy > len)
++			copy = len;
++		sg_set_buf(sg, xdp->data + offset, copy);
++		elt++;
++		if ((len -= copy) == 0)
++			goto out;
++		offset += copy;
++	}
++
++	if (unlikely(!xdp_buff_has_frags(xdp)))
++		goto out; /* Should not be reached */
++
++	sinfo = xdp_get_shared_info_from_buff(xdp);
++
++	/* Page frags from xdp_shared_info */
++	for (i = 0; i < sinfo->nr_frags; i++) {
++		int end;
++
++		if (unlikely(start > offset + len))
++			return -EINVAL;
++
++		end = start + skb_frag_size(&sinfo->frags[i]);
++		if ((copy = end - offset) > 0) {
++			skb_frag_t *frag = &sinfo->frags[i];
++
++			if (unlikely(elt && sg_is_last(&sg[elt - 1])))
++				return -EMSGSIZE;
++
++			if (copy > len)
++				copy = len;
++			sg_set_page(&sg[elt], skb_frag_page(frag), copy,
++				    skb_frag_off(frag) + offset - start);
++			elt++;
++			if (!(len -= copy))
++				goto out;
++			offset += copy;
++		}
++		start = end;
++	}
++
++out:
++	if (unlikely(len))
++		return -EINVAL; /* Should not be reached */
++
++	if (elt)
++		sg_mark_end(&sg[elt - 1]);
++	return elt;
++}
++
++int bpf_dynptr_to_sgvec(const struct bpf_dynptr_kern *ptr_kern,
++			struct scatterlist *sg, int sg_max_entries)
++{
++	enum bpf_dynptr_type type = bpf_dynptr_get_type(ptr_kern);
++	u32 size = __bpf_dynptr_size(ptr_kern);
++	u32 offset = ptr_kern->offset;
++	int nr_frags;
++
++	if (!ptr_kern->data || !size)
++		return -EINVAL;
++
++	switch (type) {
++	case BPF_DYNPTR_TYPE_XDP: {
++		struct xdp_buff *xdp = ptr_kern->data;
++		unsigned int xdp_len;
++
++		xdp_len = xdp_get_buff_len(xdp);
++		if (unlikely(size > xdp_len || offset > xdp_len - size))
++			return -E2BIG;
++
++		nr_frags = unlikely(xdp_buff_has_frags(xdp)) ?
++			xdp_get_shared_info_from_buff(xdp)->nr_frags : 0;
++		if (nr_frags + 1 > sg_max_entries)
++			return -EMSGSIZE;
++
++		sg_init_table(sg, nr_frags + 1);
++		return bpf_xdp_to_sgvec(xdp, sg, offset, size);
++	}
++	case BPF_DYNPTR_TYPE_SKB: {
++		struct sk_buff *skb = ptr_kern->data;
++
++		if (unlikely(size > skb->len || offset > skb->len - size))
++			return -E2BIG;
++
++		if (unlikely(!__bpf_dynptr_is_rdonly(ptr_kern) && skb_cloned(skb)))
++			return -EINVAL;
++
++		nr_frags = skb_shinfo(skb)->nr_frags;
++		if (nr_frags + 1 > sg_max_entries)
++			return -EMSGSIZE;
++
++		sg_init_table(sg, nr_frags + 1);
++		return skb_to_sgvec(skb, sg, offset, size);
++	}
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++EXPORT_SYMBOL_GPL(bpf_dynptr_to_sgvec);
++
+ BTF_KFUNCS_START(bpf_kfunc_check_set_skb)
+ BTF_ID_FLAGS(func, bpf_dynptr_from_skb, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_dynptr_checksum)
+-- 
+2.55.0
+

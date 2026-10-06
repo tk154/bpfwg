@@ -1,30 +1,27 @@
-From c76001c49a9b5090f0c599278d63839fb013b954 Mon Sep 17 00:00:00 2001
+From a214dadbcc47a0e64d1206e1a472eb338ab3cbec Mon Sep 17 00:00:00 2001
 From: Til Kaiser <mail@tk154.de>
 Date: Wed, 14 Jan 2026 21:44:10 +0100
-Subject: [PATCH 1/3] bpf: add kfuncs to checksum XDP and SKB packet data
+Subject: [PATCH 1/5] bpf: add kfuncs to checksum XDP and SKB packet data
 
 ---
- net/core/filter.c | 73 +++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 73 insertions(+)
+ net/core/filter.c | 86 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
 
 diff --git a/net/core/filter.c b/net/core/filter.c
-index 06e179865a21..560ea52f331a 100644
+index 42385e790431..3f6ecd52d1d0 100644
 --- a/net/core/filter.c
 +++ b/net/core/filter.c
-@@ -12113,6 +12113,77 @@ __bpf_kfunc int bpf_sk_assign_tcp_reqsk(struct __sk_buff *s, struct sock *sk,
- #endif
+@@ -12084,6 +12084,55 @@ void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset)
+ 	return skb_metadata_end(skb) - skb_metadata_len(skb) + offset;
  }
  
-+/* Checksum xdp data. */
-+__bpf_kfunc u32 bpf_xdp_checksum(struct xdp_md *xdp_ctx, u32 offset, u32 len, u32 csum)
++static s64 bpf_xdp_checksum(struct xdp_buff *xdp, u32 offset, u32 len, u32 csum)
 +{
-+	struct xdp_buff *xdp = (struct xdp_buff *)xdp_ctx;
 +	int start = xdp->data_end - xdp->data;
 +	struct skb_shared_info *sinfo;
 +	int i, copy = start - offset;
 +	int pos = 0;
 +
-+	/* Checksum header. */
 +	if (copy > 0) {
 +		if (copy > len)
 +			copy = len;
@@ -32,39 +29,30 @@ index 06e179865a21..560ea52f331a 100644
 +		if ((len -= copy) == 0)
 +			return csum;
 +		offset += copy;
-+		pos	= copy;
++		pos = copy;
 +	}
 +
-+	if (likely(!xdp_buff_has_frags(xdp)))
-+		goto out;
++	if (unlikely(!xdp_buff_has_frags(xdp)))
++		return -EINVAL; /* Should not be reached */
 +
 +	sinfo = xdp_get_shared_info_from_buff(xdp);
 +
 +	for (i = 0; i < sinfo->nr_frags; i++) {
-+		int end;
 +		skb_frag_t *frag = &sinfo->frags[i];
-+
-+		WARN_ON(start > offset + len);
++		int end;
 +
 +		end = start + skb_frag_size(frag);
 +		if ((copy = end - offset) > 0) {
-+			u32 p_off, p_len, copied;
-+			struct page *p;
 +			__wsum csum2;
-+			u8 *vaddr;
++			void *vaddr;
 +
 +			if (copy > len)
 +				copy = len;
 +
-+			skb_frag_foreach_page(frag,
-+					      skb_frag_off(frag) + offset - start,
-+					      copy, p, p_off, p_len, copied) {
-+				vaddr = kmap_atomic(p);
-+				csum2 = csum_partial(vaddr + p_off, p_len, 0);
-+				kunmap_atomic(vaddr);
-+				csum = csum_block_add(csum, csum2, pos);
-+				pos += p_len;
-+			}
++			vaddr = skb_frag_address(frag) + (offset - start);
++			csum2 = csum_partial(vaddr, copy, 0);
++			csum = csum_block_add(csum, csum2, pos);
++			pos += copy;
 +
 +			if (!(len -= copy))
 +				return csum;
@@ -73,35 +61,70 @@ index 06e179865a21..560ea52f331a 100644
 +		start = end;
 +	}
 +
-+out:
-+	BUG_ON(len);
-+
-+	return csum;
++	return -EINVAL; /* Should not be reached */
 +}
 +
-+__bpf_kfunc u32 bpf_skb_checksum(struct __sk_buff *skb_ctx, u32 offset, u32 len, u32 csum)
+ __bpf_kfunc_start_defs();
+ __bpf_kfunc int bpf_dynptr_from_skb(struct __sk_buff *s, u64 flags,
+ 				    struct bpf_dynptr *ptr__uninit)
+@@ -12382,6 +12431,41 @@ __bpf_kfunc int bpf_xdp_pull_data(struct xdp_md *x, u32 len)
+ 	return 0;
+ }
+ 
++/* Checksum dynptr data. */
++__bpf_kfunc s64 bpf_dynptr_checksum(const struct bpf_dynptr *ptr, u32 csum)
 +{
-+	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	const struct bpf_dynptr_kern *ptr_kern = (const struct bpf_dynptr_kern *)ptr;
++	enum bpf_dynptr_type type = bpf_dynptr_get_type(ptr_kern);
++	u32 size = __bpf_dynptr_size(ptr_kern);
++	u32 offset = ptr_kern->offset;
 +
-+	return skb_checksum(skb, offset, len, csum);
++	if (!ptr_kern->data || !size)
++		return -EINVAL;
++
++	switch (type) {
++	case BPF_DYNPTR_TYPE_XDP: {
++		struct xdp_buff *xdp = ptr_kern->data;
++		unsigned int xdp_len;
++
++		xdp_len = xdp_get_buff_len(xdp);
++		if (unlikely(size > xdp_len || offset > xdp_len - size))
++			return -E2BIG;
++
++		return bpf_xdp_checksum(xdp, offset, size, csum);
++	}
++	case BPF_DYNPTR_TYPE_SKB: {
++		struct sk_buff *skb = ptr_kern->data;
++
++		if (unlikely(size > skb->len || offset > skb->len - size))
++			return -E2BIG;
++
++		return skb_checksum(skb, offset, size, csum);
++	}
++	default:
++		return -EOPNOTSUPP;
++	}
 +}
 +
  __bpf_kfunc_end_defs();
  
  int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
-@@ -12132,10 +12203,12 @@ int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
+@@ -12401,6 +12485,7 @@ int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
  
  BTF_KFUNCS_START(bpf_kfunc_check_set_skb)
  BTF_ID_FLAGS(func, bpf_dynptr_from_skb, KF_TRUSTED_ARGS)
-+BTF_ID_FLAGS(func, bpf_skb_checksum)
++BTF_ID_FLAGS(func, bpf_dynptr_checksum)
  BTF_KFUNCS_END(bpf_kfunc_check_set_skb)
  
+ BTF_KFUNCS_START(bpf_kfunc_check_set_skb_meta)
+@@ -12410,6 +12495,7 @@ BTF_KFUNCS_END(bpf_kfunc_check_set_skb_meta)
  BTF_KFUNCS_START(bpf_kfunc_check_set_xdp)
  BTF_ID_FLAGS(func, bpf_dynptr_from_xdp)
-+BTF_ID_FLAGS(func, bpf_xdp_checksum)
+ BTF_ID_FLAGS(func, bpf_xdp_pull_data)
++BTF_ID_FLAGS(func, bpf_dynptr_checksum)
  BTF_KFUNCS_END(bpf_kfunc_check_set_xdp)
  
  BTF_KFUNCS_START(bpf_kfunc_check_set_sock_addr)
 -- 
-2.53.0
+2.55.0
 

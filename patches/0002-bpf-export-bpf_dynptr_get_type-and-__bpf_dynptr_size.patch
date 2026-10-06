@@ -1,0 +1,56 @@
+From 6ac88c497c1d071a6fca464b571c70aed27dec62 Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Fri, 10 Jul 2026 21:33:57 +0200
+Subject: [PATCH 2/5] bpf: export bpf_dynptr_get_type and __bpf_dynptr_size
+
+Make `bpf_dynptr_get_type()` and `__bpf_dynptr_size()` available to kernel
+modules by exporting them via EXPORT_SYMBOL. The function prototype for
+`bpf_dynptr_get_type()` is also added to `include/linux/bpf.h`.
+
+This allows external modules to query the type and native length bounds of
+a BPF dynamic pointer (dynptr).
+
+Signed-off-by: Til Kaiser <mail@tk154.de>
+---
+ include/linux/bpf.h  | 1 +
+ kernel/bpf/helpers.c | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index e264c695f31c..a9437596224f 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1386,6 +1386,7 @@ u32 __bpf_dynptr_size(const struct bpf_dynptr_kern *ptr);
+ const void *__bpf_dynptr_data(const struct bpf_dynptr_kern *ptr, u32 len);
+ void *__bpf_dynptr_data_rw(const struct bpf_dynptr_kern *ptr, u32 len);
+ bool __bpf_dynptr_is_rdonly(const struct bpf_dynptr_kern *ptr);
++enum bpf_dynptr_type bpf_dynptr_get_type(const struct bpf_dynptr_kern *ptr);
+ int __bpf_dynptr_write(const struct bpf_dynptr_kern *dst, u32 offset,
+ 		       void *src, u32 len, u64 flags);
+ void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr *p, u32 offset,
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 5aed5659822f..c38adb6a3d81 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1697,15 +1697,17 @@ static void bpf_dynptr_set_type(struct bpf_dynptr_kern *ptr, enum bpf_dynptr_typ
+ 	ptr->size |= type << DYNPTR_TYPE_SHIFT;
+ }
+ 
+-static enum bpf_dynptr_type bpf_dynptr_get_type(const struct bpf_dynptr_kern *ptr)
++enum bpf_dynptr_type bpf_dynptr_get_type(const struct bpf_dynptr_kern *ptr)
+ {
+ 	return (ptr->size & ~(DYNPTR_RDONLY_BIT)) >> DYNPTR_TYPE_SHIFT;
+ }
++//EXPORT_SYMBOL(bpf_dynptr_get_type);
+ 
+ u32 __bpf_dynptr_size(const struct bpf_dynptr_kern *ptr)
+ {
+ 	return ptr->size & DYNPTR_SIZE_MASK;
+ }
++EXPORT_SYMBOL(__bpf_dynptr_size);
+ 
+ static void bpf_dynptr_set_size(struct bpf_dynptr_kern *ptr, u32 new_size)
+ {
+-- 
+2.55.0
+
