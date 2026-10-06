@@ -1,4 +1,4 @@
-From bd74604dabf40eb5d52c888ff49973f9db8320e0 Mon Sep 17 00:00:00 2001
+From 187e5c59aa181a55bd422bb14e971e904c480e3d Mon Sep 17 00:00:00 2001
 From: Til Kaiser <mail@tk154.de>
 Date: Tue, 6 Oct 2026 16:24:12 +0200
 Subject: [PATCH 5/5] wireguard: add eBPF kfuncs for explicit peer traffic

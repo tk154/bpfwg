@@ -1,4 +1,4 @@
-From 2201aa53e0d8645dc0d003618631dd231ea69bcf Mon Sep 17 00:00:00 2001
+From e7e8e6b11303cdba5a1b8b1d79a5e3a8289c8979 Mon Sep 17 00:00:00 2001
 From: Til Kaiser <mail@tk154.de>
 Date: Thu, 9 Jul 2026 21:37:33 +0200
 Subject: [PATCH 4/5] wireguard: add eBPF kfuncs for data plane interaction
