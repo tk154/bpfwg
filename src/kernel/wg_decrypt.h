@@ -23,7 +23,6 @@ struct wg_decrypt_inner {
 };
 
 struct wg_decrypt_layout {
-    __u16 iph_len;
     __u16 header_len;
     __u16 payload_offset;
     __u16 payload_len;
@@ -50,9 +49,10 @@ enum wg_action wg_decrypt_lookup_key(struct wg_device *wg_device, struct wg_head
 __always_inline static
 void wg_decrypt_build_layout(struct packet_header *header, struct wg_decrypt_layout *layout)
 {
-    layout->iph_len = header->l3.family == AF_INET ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
-    layout->header_len = layout->iph_len + sizeof(struct udphdr) + sizeof(struct wg_header);
-    layout->payload_offset = header->l3.offset + layout->iph_len + sizeof(struct udphdr) + sizeof(struct wg_header);
+    layout->header_len = header->l3.hdr_len +
+        sizeof(struct udphdr) + sizeof(struct wg_header);
+    layout->payload_offset = header->l3.offset + header->l3.hdr_len +
+        sizeof(struct udphdr) + sizeof(struct wg_header);
     layout->payload_len = header->l4.payload_len - sizeof(struct wg_header);
 }
 
@@ -63,12 +63,8 @@ enum wg_action wg_decrypt_packet(struct packet_data *pkt, struct wg_decrypt_layo
     struct bpf_dynptr ptr;
     long ret;
 
-    if (!pkt->is_xdp) {
-        if (!bpf_skb_linearize(pkt))
-            return WG_ACTION_DROP;
-
-        pkt->p = pkt->data + layout->payload_offset;
-    }
+    /*if (!pkt->is_xdp && !bpf_skb_linearize(pkt, layout->payload_offset))
+        return WG_ACTION_DROP;*/
 
     if (!bpf_dynptr_from_packet(&ptr, pkt, layout->payload_offset, layout->payload_len))
         return WG_ACTION_DROP;
@@ -100,22 +96,21 @@ bool wg_parse_inner_l3(struct packet_data *pkt, struct packet_header *header,
         case 4:
             if (!parse_ipv4_header(pkt, &inner->l3))
                 return false;
-            inner->addr_len = 4;
-            inner->header_len = layout->header_len;
-            inner->trailer_len = header->l3.tot_len -
-                layout->header_len - inner->l3.tot_len;
-            return true;
+            inner->addr_len = sizeof(struct in_addr);
+            break;
         case 6:
             if (!parse_ipv6_header(pkt, &inner->l3))
                 return false;
-            inner->addr_len = 16;
-            inner->header_len = layout->header_len;
-            inner->trailer_len = header->l3.tot_len -
-                layout->header_len - inner->l3.tot_len;
-            return true;
+            inner->addr_len = sizeof(struct in6_addr);
+            break;
         default:
             return false;
     }
+
+    inner->header_len = layout->header_len;
+    inner->trailer_len = header->l3.tot_len -
+        layout->header_len - inner->l3.tot_len;
+    return true;
 }
 
 __always_inline static
@@ -142,7 +137,7 @@ enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
                           struct bpf_sock *sock, struct wg_decrypt_inner *inner)
 {
     struct wg_decrypt_layout layout;
-    struct noise_keypair *keypair;
+    struct noise_keypair *keypair = NULL;
     struct wg_device *wg_device;
     enum wg_action action;
     struct wg_peer *peer;

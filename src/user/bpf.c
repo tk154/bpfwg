@@ -803,6 +803,17 @@ int bpf_set_config(struct bpf_handle *bpf, struct bpfwg_config *cfg) {
     return BPFWG_RC_OK;
 }
 
+int bpf_set_ct_config(struct bpf_handle *bpf, const struct bpfwg_ct *cfg) {
+    struct bpfwg_ct *ct_config;
+
+    ct_config = bpf_get_section_data(bpf->obj, BPFWG_CT_SECTION, sizeof(*ct_config));
+    if (!ct_config)
+        return BPFWG_RC_ERR;
+
+    memcpy(ct_config, cfg, sizeof(*ct_config));
+    return BPFWG_RC_OK;
+}
+
 int bpf_set_dsa_config(struct bpf_handle *bpf, const struct bpfwg_dsa *cfg) {
     if (bpf->obj_loaded) {
         bpfwg_error("DSA config must be set before loading the BPF object.\n");

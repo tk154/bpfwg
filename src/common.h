@@ -27,6 +27,7 @@
 #define BPFWG_CONFIG_SECTION              ".rodata.config"
 #define BPFWG_DSA_SECTION                 ".rodata.dsa"
 #define BPFWG_RSS_SECTION                 ".rodata.rss"
+#define BPFWG_CT_SECTION                  ".rodata.ct"
 
 enum dsa_proto {
     DSA_PROTO_NONE = 0,
@@ -44,6 +45,11 @@ struct bpfwg_dsa {
 struct bpfwg_rss {
     __u32 cpu_count;
     __u32 indir[BPFWG_RSS_INDIR_SIZE];
+};
+
+struct bpfwg_ct {
+    __u32 timeout_tcp;
+    __u32 timeout_udp;
 };
 
 struct bpfwg_config {

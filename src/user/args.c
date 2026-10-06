@@ -269,6 +269,28 @@ static int parse_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     return BPFWG_RC_OK;
 }
 
+static bool read_ct_timeout(const char *path, __u32 *timeout_ms) {
+    FILE *file = fopen(path, "r");
+    __u32 timeout;
+
+    if (!file) {
+        bpfwg_error("Could not open conntrack timeout procfs %s: %s (-%d).\n",
+            path, strerror(errno), errno);
+        return false;
+    }
+
+    if (fscanf(file, "%u", &timeout) != 1) {
+        bpfwg_error("Failed to read conntrack timeout from %s.\n", path);
+        fclose(file);
+        return false;
+    }
+
+    fclose(file);
+    *timeout_ms = timeout * 1000;
+
+    return true;
+}
+
 int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     int rc;
 
@@ -283,11 +305,22 @@ int check_cmd_args(int argc, char* argv[], struct cmd_args *args) {
     args->rss_only = false;
     args->config.conntrack = false;
     args->config.udp_nocheck = false;
+    memset(&args->ct_config, 0, sizeof(args->ct_config));
     memset(&args->dsa_config, 0, sizeof(args->dsa_config));
 
     rc = parse_cmd_args(argc, argv, args);
-    if (rc == BPFWG_RC_ERR)
+    if (rc == BPFWG_RC_ERR) {
         print_usage(argv[0], stderr);
+        return rc;
+    }
+
+    if (args->config.conntrack) {
+        if (!read_ct_timeout("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established",
+                &args->ct_config.timeout_tcp) ||
+            !read_ct_timeout("/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+                &args->ct_config.timeout_udp))
+            return BPFWG_RC_ERR;
+    }
 
     return rc;
 }

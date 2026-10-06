@@ -24,6 +24,7 @@ enum wg_message_type {
 };
 
 enum wg_action {
+    WG_ACTION_OTHER = -2,
     WG_ACTION_DROP = -1,
     WG_ACTION_PASS = 0,
     WG_ACTION_REDIRECT = 1

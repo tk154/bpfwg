@@ -13,6 +13,7 @@ struct cmd_args {
 
     enum bpf_hook hook;
     struct bpfwg_config config;
+    struct bpfwg_ct ct_config;
     struct bpfwg_dsa dsa_config;
     struct bpfwg_cpu_list rss_excluded_cpus;
     bool dsa, rss_only;

@@ -47,10 +47,13 @@ int main(int argc, char *argv[]) {
     if (!bpf)
         goto out;
 
+    if (bpf_set_config(bpf, &args.config) != BPFWG_RC_OK)
+        goto bpf_destroy;
+
     if (dsa_enabled && bpf_set_dsa_config(bpf, &args.dsa_config) != BPFWG_RC_OK)
         goto bpf_destroy;
 
-    if (bpf_set_config(bpf, &args.config) != BPFWG_RC_OK)
+    if (args.config.conntrack && bpf_set_ct_config(bpf, &args.ct_config) != BPFWG_RC_OK)
         goto bpf_destroy;
 
     if (args.rss_prog_name) {

@@ -13,6 +13,7 @@ void bpf_destroy(struct bpf_handle *bpf);
 int bpf_init_rss(struct bpf_handle *bpf, const char *rss_prog_name,
                  const struct bpfwg_cpu_list *excluded_cpus, bool rss_only);
 int bpf_set_config(struct bpf_handle *bpf, struct bpfwg_config *cfg);
+int bpf_set_ct_config(struct bpf_handle *bpf, const struct bpfwg_ct *cfg);
 int bpf_set_dsa_config(struct bpf_handle *bpf, const struct bpfwg_dsa *cfg);
 
 int bpf_attach_program(struct bpf_handle *bpf, enum bpf_hook hook, char *ifaces[], unsigned int ifaces_count);

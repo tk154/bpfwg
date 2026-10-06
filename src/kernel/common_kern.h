@@ -1,7 +1,9 @@
 #ifndef COMMON_KERN_H
 #define COMMON_KERN_H
 
+#include <bits/sockaddr.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include <linux/types.h>
 #include <bpf/bpf_endian.h>
@@ -58,13 +60,15 @@ struct l2_header {
 
 struct l3_header {
     __be32 *src_ip, *dest_ip;
+    __sum16 *check;
+    sa_family_t family;
     __u16 tot_len;
-    __u8 family, proto, offset;
+    __u8 proto, offset, hdr_len;
 };
 
 struct l4_header {
-    __be16 src_port;
-	__be16 dest_port;
+    __be16 *src_port, *dest_port;
+    __sum16 *check;
     __u16 payload_len;
 };
 
@@ -110,7 +114,7 @@ bool bpf_dynptr_from_packet(struct bpf_dynptr *ptr, struct packet_data *pkt,
 }
 
 __always_inline static
-bool bpf_skb_linearize(struct packet_data *pkt)
+bool bpf_skb_linearize(struct packet_data *pkt, __u16 offset)
 {
     struct __sk_buff *skb = (struct __sk_buff *)pkt->ctx;
     int ret;
@@ -123,6 +127,7 @@ bool bpf_skb_linearize(struct packet_data *pkt)
 
     pkt->data = (void *)(long)skb->data;
     pkt->data_end = (void *)(long)skb->data_end;
+    pkt->p = pkt->data + offset;
     return true;
 }
 
@@ -166,10 +171,12 @@ bool bpf_skb_adjust_packet(struct packet_data *pkt, __s32 head, __s32 tail, sa_f
         flags = family == AF_INET ? BPF_F_ADJ_ROOM_DECAP_L3_IPV4 : BPF_F_ADJ_ROOM_DECAP_L3_IPV6;
     }
 
-    ret = bpf_skb_change_tail(skb, skb->len + tail, 0);
-    if (ret) {
-        bpf_printk("bpf_skb_change_tail: %d", ret);
-        return false;
+    if (tail > 0 || (skb->data_end - skb->data) == skb->len) {
+        ret = bpf_skb_change_tail(skb, skb->len + tail, 0);
+        if (ret) {
+            bpf_printk("bpf_skb_change_tail: %d", ret);
+            return false;
+        }
     }
 
     ret = bpf_skb_adjust_room(skb, head, BPF_ADJ_ROOM_MAC, flags /*| BPF_F_ADJ_ROOM_FIXED_GSO*/);
@@ -201,24 +208,33 @@ void ip6cpy(__be32 dest[4], const __be32 src[4])
 }
 
 __always_inline static
-__u32 bpf_sock_tuple_from_header(struct bpf_sock_tuple *tuple, struct l3_header *l3, struct l4_header *l4)
+__u32 bpf_sock_tuple_from_header(struct bpf_sock_tuple *tuple,
+                                 struct l3_header *l3, struct l4_header *l4)
 {
-    switch (l3->family) {
-        case AF_INET:
-            tuple->ipv4.saddr = *l3->src_ip;
-            tuple->ipv4.daddr = *l3->dest_ip;
-            tuple->ipv4.sport =  l4->src_port;
-            tuple->ipv4.dport =  l4->dest_port;
-            return sizeof(tuple->ipv4);
-        case AF_INET6:
-            ip6cpy(tuple->ipv6.saddr, l3->src_ip);
-            ip6cpy(tuple->ipv6.daddr, l3->dest_ip);
-            tuple->ipv6.sport = l4->src_port;
-            tuple->ipv6.dport = l4->dest_port;
-            return sizeof(tuple->ipv6);
-        default:
-            return 0;
+    __u32 tuple_size;
+
+    if (l3->family == AF_INET) {
+        tuple->ipv4.saddr = *l3->src_ip;
+        tuple->ipv4.daddr = *l3->dest_ip;
+        tuple->ipv4.sport = *l4->src_port;
+        tuple->ipv4.dport = *l4->dest_port;
+        tuple_size = sizeof(tuple->ipv4);
     }
+    else {
+        ip6cpy(tuple->ipv6.saddr, l3->src_ip);
+        ip6cpy(tuple->ipv6.daddr, l3->dest_ip);
+        tuple->ipv6.sport = *l4->src_port;
+        tuple->ipv6.dport = *l4->dest_port;
+        tuple_size = sizeof(tuple->ipv6);
+    }
+
+    return tuple_size;
+}
+
+__always_inline static
+void packet_set_offset(struct packet_data *pkt, __u16 offset)
+{
+    pkt->p = pkt->data + offset;
 }
 
 

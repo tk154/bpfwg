@@ -1,6 +1,7 @@
 #ifndef RECEIVE_H
 #define RECEIVE_H
 
+#include <bpf/bpf_helpers.h>
 #include <linux/in.h>
 
 #include <linux/if_ether.h>
@@ -13,6 +14,9 @@
 
 #include "endian.h"
 #include "dsa/dsa.h"
+
+#define IP_MF		0x2000	/* "More Fragments" */
+#define IP_OFFSET	0x1fff	/* "Fragment Offset" */
 
 #define IP_VERSION(ip)	(*(__u8 *)(ip) >> 4)
 
@@ -29,15 +33,25 @@ bool parse_eth_header(struct packet_data *pkt, struct l2_header *l2)
 __always_inline static
 bool parse_ipv4_header(struct packet_data *pkt, struct l3_header *l3)
 {
-    struct iphdr *ip4h;
-    parse_header(ip4h, pkt);
+	struct iphdr *ip4h;
+	parse_header(ip4h, pkt);
 
-    l3->family  = AF_INET;
+	/* ip fragmented traffic */
+	if (ip4h->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+		return false;
+
+	/* ip options */
+	if (ip4h->ihl * 4 != sizeof(*ip4h))
+		return false;
+
+	l3->family  = AF_INET;
 	l3->src_ip  = &ip4h->saddr;
 	l3->dest_ip = &ip4h->daddr;
+	l3->check   = &ip4h->check;
 
 	l3->proto   = ip4h->protocol;
 	l3->tot_len = bpf_ntohs(ip4h->tot_len);
+	l3->hdr_len = sizeof(*ip4h);
 
     return true;
 }
@@ -45,17 +59,18 @@ bool parse_ipv4_header(struct packet_data *pkt, struct l3_header *l3)
 __always_inline static
 bool parse_ipv6_header(struct packet_data *pkt, struct l3_header *l3)
 {
-    struct ipv6hdr *ip6h;
-    parse_header(ip6h, pkt);
+	struct ipv6hdr *ip6h;
+	parse_header(ip6h, pkt);
 
-    l3->family  = AF_INET6;
+	l3->family  = AF_INET6;
 	l3->src_ip  = ip6h->saddr.in6_u.u6_addr32;
 	l3->dest_ip = ip6h->daddr.in6_u.u6_addr32;
 
 	l3->proto   = ip6h->nexthdr;
 	l3->tot_len = bpf_ntohs(ip6h->payload_len) + sizeof(*ip6h);
+	l3->hdr_len = sizeof(*ip6h);
 
-    return true;
+	return true;
 }
 
 __always_inline static
@@ -64,8 +79,12 @@ bool parse_tcp_header(struct packet_data *pkt, struct l4_header *l4)
 	struct tcphdr *tcph;
 	parse_header(tcph, pkt);
 
-    l4->src_port = tcph->source;
-	l4->dest_port = tcph->dest;
+	if (tcph->syn || tcph->fin || tcph->rst)
+		return false;
+
+	l4->src_port = &tcph->source;
+	l4->dest_port = &tcph->dest;
+	l4->check = &tcph->check;
 
 	return true;
 }
@@ -76,8 +95,9 @@ bool parse_udp_header(struct packet_data *pkt, struct l4_header *l4)
 	struct udphdr *udph;
 	parse_header(udph, pkt);
 
-    l4->src_port = udph->source;
-	l4->dest_port = udph->dest;
+	l4->src_port = &udph->source;
+	l4->dest_port = &udph->dest;
+	l4->check = &udph->check;
 	l4->payload_len = bpf_ntohs(udph->len) - sizeof(*udph);
 
 	return true;
@@ -130,7 +150,7 @@ bool parse_l4_header(struct packet_data *pkt, __u8 proto, struct l4_header *l4)
 
 
 __always_inline static
-int fib_lookup(struct packet_data *pkt, struct l3_header *l3)
+__u32 fib_lookup(struct packet_data *pkt, struct l3_header *l3)
 {
     struct bpf_fib_lookup fib = {};
     long ret;
@@ -159,6 +179,13 @@ int fib_lookup(struct packet_data *pkt, struct l3_header *l3)
             //bpf_printk("%s: %d", __func__, ret);
             return 0;
     }
+}
+
+__always_inline static
+struct bpf_sock *sock_lookup(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
+                             __u32 tuple_size)
+{
+    return bpf_sk_lookup_udp(pkt->ctx, tuple, tuple_size, BPF_F_CURRENT_NETNS, 0);
 }
 
 

@@ -14,8 +14,8 @@
 #include "endian.h"
 #include "dsa/dsa.h"
 
-__s64 bpf_dynptr_checksum(struct bpf_dynptr *ptr, __u32 csum) __ksym;
 
+__s64 bpf_dynptr_checksum(struct bpf_dynptr *ptr, __u32 csum) __ksym;
 
 __always_inline static
 __s32 push_eth_header(struct ethhdr *ethh, struct packet_data *pkt, struct bpf_fib_lookup *fib)
@@ -76,10 +76,9 @@ __sum16 ip_checksum(struct iphdr *iph)
 __always_inline static
 __sum16 udp_checksum(struct packet_data *pkt, __u8 offset, __u16 len, __s64 sum)
 {
+    struct udphdr *udph = pkt->data + offset;
     struct bpf_dynptr ptr;
-    struct udphdr *udph;
 
-    udph = pkt->data + offset;
     if ((void *)(udph + 1) > pkt->data_end)
         return 0;
 
@@ -151,22 +150,8 @@ __sum16 udp_v6_checksum(struct packet_data *pkt, __u8 offset, __u16 len,
 
 
 __always_inline static
-bool push_wg_header(void *data, void *data_end, __le32 key_idx, __u64 counter)
-{
-    struct wg_header *wgh = data;
-
-    if ((void *)(wgh + 1) > data_end)
-        return false;
-
-    wgh->type = bpf_cpu_to_le32(WG_MESSAGE_DATA);
-    wgh->key_idx = key_idx;
-    wgh->counter = bpf_cpu_to_le64(counter);
-    return true;
-}
-
-__always_inline static
-bool create_wg4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
-                       __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
+bool create_udp4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
+                        __u8 iph_offset, __u16 tot_len)
 {
     struct iphdr *ip4h = pkt->data + iph_offset;
     __u16 udp_off = iph_offset + sizeof(*ip4h);
@@ -194,13 +179,10 @@ bool create_wg4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
     udph->source = tuple->ipv4.sport;
     udph->dest = tuple->ipv4.dport;
     udph->len = bpf_htons(udp_len);
-
-    if (!push_wg_header(udph + 1, pkt->data_end, key_idx, counter))
-        return false;
+    udph->check = 0;
 
     if (!config.udp_nocheck) {
-        udph->check = udp_v4_checksum(pkt, iph_offset + sizeof(*ip4h), udp_len,
-                                ip4h->saddr, ip4h->daddr);
+        udph->check = udp_v4_checksum(pkt, udp_off, udp_len, ip4h->saddr, ip4h->daddr);
         if (!udph->check) {
             bpf_printk("udp_v4_checksum error");
             return false;
@@ -211,8 +193,8 @@ bool create_wg4_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
 }
 
 __always_inline static
-bool create_wg6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
-                       __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
+bool create_udp6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
+                        __u8 iph_offset, __u16 tot_len)
 {
     struct ipv6hdr *ip6h = pkt->data + iph_offset;
     __u16 udp_off = iph_offset + sizeof(*ip6h);
@@ -238,12 +220,9 @@ bool create_wg6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
     udph->source = tuple->ipv6.sport;
     udph->dest = tuple->ipv6.dport;
     udph->len = payload_len;
+    udph->check = 0;
 
-    if (!push_wg_header(udph + 1, pkt->data_end, key_idx, counter))
-        return false;
-
-    udph->check = udp_v6_checksum(pkt, iph_offset + sizeof(*ip6h), udp_len,
-                            &ip6h->saddr, &ip6h->daddr);
+    udph->check = udp_v6_checksum(pkt, udp_off, udp_len, &ip6h->saddr, &ip6h->daddr);
     if (!udph->check) {
         bpf_printk("udp_v6_checksum error");
         return false;
@@ -253,11 +232,11 @@ bool create_wg6_tunnel(struct packet_data *pkt, struct bpf_sock_tuple *tuple,
 }
 
 __always_inline static
-bool create_wg_tunnel(struct packet_data *pkt, sa_family_t family, struct bpf_sock_tuple *tuple,
-                      __u8 iph_offset, __u16 tot_len, __le32 key_idx, __u64 counter)
+bool create_udp_tunnel(struct packet_data *pkt, sa_family_t family,
+                       struct bpf_sock_tuple *tuple, __u8 iph_offset, __u16 tot_len)
 {
-    return family == AF_INET ? create_wg4_tunnel(pkt, tuple, iph_offset, tot_len, key_idx, counter):
-                               create_wg6_tunnel(pkt, tuple, iph_offset, tot_len, key_idx, counter);
+    return family == AF_INET ? create_udp4_tunnel(pkt, tuple, iph_offset, tot_len):
+                               create_udp6_tunnel(pkt, tuple, iph_offset, tot_len);
 }
 
 
