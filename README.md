@@ -34,9 +34,25 @@ Build the userspace loader:
 make -C src/user
 ```
 
-The userspace loader links against `libbpf` and `libmnl`, so the corresponding
-development headers/libraries must be available in the host or target staging
-environment.
+The BPF build requires Clang with the BPF target and GNU C23 support, plus the
+Linux and libbpf headers. The userspace loader links against `libbpf`, `libelf`,
+`zlib`, and `libmnl`, so their development headers/libraries must be available in
+the host or target staging environment. Use a libbpf version that supports TCX
+(`bpf_program__attach_tcx()`) and a kernel with TCX ingress support.
+
+The WireGuard datapath requires the kernel patches in `patches/`, applied in
+numeric order to a compatible kernel tree and built with WireGuard and BPF
+support:
+
+1. `0001`: dynptr-based checksums for XDP and SKB packet data.
+2. `0002`: dynptr helper visibility and size export for kernel modules.
+3. `0003`: dynptr-to-scatterlist conversion for packet cryptography.
+4. `0004`: WireGuard device, peer, keypair, endpoint, and crypto kfuncs.
+5. `0005`: explicit WireGuard traffic/error accounting kfuncs and atomic peer
+   byte counters.
+
+Conntrack mode additionally requires the kernel's BPF conntrack lookup and
+timeout-change kfuncs, and readable conntrack timeout sysctls.
 
 For OpenWrt cross builds, pass the OpenWrt tree and target parameters expected by
 `src/user/OpenWrt.mk`, for example:
@@ -53,7 +69,7 @@ src/user/bin/host/bpfwg [options] <hook> <network_interface> [network_interface.
 
 Hooks:
 
-- `tc`: attach the TC ingress program.
+- `tc`: attach the TC ingress program through a TCX BPF link.
 - `xdp`: attach XDP with automatic mode selection.
 - `xdpgeneric`: attach generic/SKB XDP.
 - `xdpnative`: attach native/driver XDP.
@@ -62,24 +78,26 @@ Hooks:
 Options:
 
 - `-?`, `-h`, `--help`: print detailed help and exit.
-- `-c`, `--conntrack`: require conntrack entries before redirecting packets.
+- `-c`, `--conntrack`: require eligible conntrack entries, refresh their timeouts, and apply existing NAT mappings.
 - `-d`, `--dsa`: require DSA discovery. DSA is auto-detected when targets are DSA user ports or a DSA conduit.
 - `-e`, `--exclude-cpus LIST`: exclude CPUs from RSS targets, e.g. `0,1,4-7`.
 - `-l`, `--log-level LEVEL`: set `error`, `warning`, `info`, `debug`, or `verbose`.
 - `-o`, `--object PATH`: select the BPF object to load.
 - `-r`, `--rss PROGRAM`: enable cpumap RSS with an XDP RSS program.
+- `-R`, `--rss-only PROGRAM`: steer packets through the CPU map to the network stack without running the WireGuard cpumap program.
 - `-u`, `--udp`: disable IPv4 UDP tunnel checksum calculation.
 
 Examples:
 
 ```sh
-./bpfwg tc eth0 -o src/kernel/obj/wg_le.o
-./bpfwg xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0
-./bpfwg xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp
+src/user/bin/host/bpfwg tc eth0 -o src/kernel/obj/wg_le.o
+src/user/bin/host/bpfwg xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0
+src/user/bin/host/bpfwg xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp
 ```
 
 The loader stays in the foreground and detaches the programs when it receives
-`SIGINT` or `SIGTERM`.
+`SIGINT` or `SIGTERM`. TCX links are destroyed on detach, leaving other TC
+attachments in place.
 
 ## RSS Mode
 
@@ -98,161 +116,178 @@ Available RSS programs in the current tree are:
 RSS requires an XDP hook. The loader rejects TC and generic XDP for RSS because
 the device-bound RSS programs need device-backed XDP metadata support.
 
+With `--rss-only`, the CPU map passes packets directly to the network stack
+instead of running `xdp_wg_cpumap`.
+
+## Conntrack Mode
+
+With `--conntrack`, both the inner TCP/UDP flow and the outer UDP tunnel must
+have eligible conntrack entries. Existing offloaded entries are accepted;
+otherwise entries must be confirmed, TCP must be established and assured, and
+entries with helpers, sequence adjustment, or NAT clashes fall back to the
+network stack. TCP SYN, FIN, and RST packets also use the network stack.
+
+The datapath applies existing source/destination NAT mappings in either flow
+direction. Inner packet rewrites update IP and transport checksums; outer tuple
+rewrites happen before creating the outgoing UDP tunnel headers or looking up
+the incoming WireGuard socket. Connection setup and NAT mapping creation remain
+with the network stack.
+
+At startup, the loader reads
+`/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established` and
+`/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream`, converts their values
+from seconds to milliseconds, and writes them into `.rodata.ct`. The datapath
+uses these values when refreshing entries. Startup fails if either value cannot
+be read; restart the loader to pick up later sysctl changes.
+
 ## Notes
 
 - The TC program passes GSO/GRO-marked SKBs instead of rewriting them.
+- IPv4 fragments and packets with IPv4 options use the network stack.
 - The BPF object expects patched WireGuard/checksum kfuncs from `patches/`.
 - The current DSA helper supports the MediaTek tag format `mtk`.
 
 ## eBPF Kernel API
 
-The BPF program uses WireGuard kfuncs to acquire WireGuard device and peer
-references, look up routing state inside WireGuard, and encrypt or decrypt packet
-data in-place. The verifier tracks acquired references, so every successful
-`wg_device` or `wg_peer` lookup must be released with the matching put helper
-before the program exits.
+The BPF program uses WireGuard kfuncs to acquire devices, peers, and receiving
+keypairs, resolve endpoints, and encrypt or decrypt packet data in-place. The
+verifier tracks acquired references: every successful device, AllowedIPs peer,
+or keypair lookup must be released with its matching put helper before exit.
+The `__sz` suffix is a verifier size annotation for memory passed to a kfunc.
 
-The `__sz` suffix in kfunc parameter names is a verifier size annotation for
-memory passed from the BPF program to the kernel.
+### Device Lookup
 
-### WireGuard Device Lookup
+```c
+struct wg_device *bpf_xdp_wg_device_get_by_index(
+    struct xdp_md *xdp_ctx, __u32 ifindex, __s32 netns_id, int *err);
+struct wg_device *bpf_skb_wg_device_get_by_index(
+    struct __sk_buff *skb_ctx, __u32 ifindex, __s32 netns_id, int *err);
+struct wg_device *bpf_wg_device_get_from_sk(struct sock *sock);
+```
 
-#### `struct wg_device *bpf_xdp_wg_device_get_by_index(struct xdp_md *xdp_ctx, __u32 ifindex)`<br>`struct wg_device *bpf_skb_wg_device_get_by_index(struct __sk_buff *skb_ctx, __u32 ifindex)`
+Index lookup acquires the WireGuard device selected by the FIB output interface.
+`netns_id` selects a network namespace; the datapath uses `BPF_F_CURRENT_NETNS`.
+Failure returns `NULL` and writes a negative error to `err`.
 
-- **Parameters:**
-  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
-  - `ifindex`: Network interface index.
-- **Returns:** Pointer to a `wg_device` or `NULL` if not found.
-- **Description:**  
-  Acquire the WireGuard device for an interface index. The encrypt path uses this
-  after `bpf_fib_lookup()` identifies the WireGuard output interface. Must be
-  released before the program exits with
-  [`bpf_wg_device_put`](#void-bpf_wg_device_putstruct-wg_device-wg).
+Incoming packets use `bpf_sk_lookup_udp()` on the outer tuple, then
+`bpf_wg_device_get_from_sk()` to acquire the WireGuard device associated with the
+socket. A socket that does not belong to WireGuard returns `NULL`. Release the
+socket separately with `bpf_sk_release()` and the device with
+`bpf_wg_device_put()`.
 
-#### `struct wg_device *bpf_xdp_wg_device_get_by_port(struct xdp_md *xdp_ctx, __u16 port)`<br>`struct wg_device *bpf_skb_wg_device_get_by_port(struct __sk_buff *skb_ctx, __u16 port)`
+### Peer, Keypair, And Endpoint Lookup
 
-- **Parameters:**
-  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
-  - `port`: WireGuard UDP listen port.
-- **Returns:** Pointer to a `wg_device` or `NULL` if not found.
-- **Description:**  
-  Acquire the WireGuard device bound to a UDP listen port. The decrypt path uses
-  this for incoming WireGuard data packets. Must be released before the program
-  exits with
-  [`bpf_wg_device_put`](#void-bpf_wg_device_putstruct-wg_device-wg).
+```c
+struct wg_peer *bpf_wg_peer_allowedips_lookup(
+    struct wg_device *wg, const void *addr, __u32 addr__sz);
+struct noise_keypair *bpf_wg_keypair_hashtable_lookup(
+    struct wg_device *wg, __le32 key_idx, unsigned long *peer);
+int bpf_wg_endpoint_tuple_get(
+    struct wg_peer *peer, struct bpf_sock_tuple *tuple);
+```
 
-### Peer Lookup
+AllowedIPs lookup acquires a peer for an IPv4 (4-byte) or IPv6 (16-byte) address,
+returning `NULL` if no live peer matches. Encryption uses the inner destination;
+decryption checks that the inner source maps to the authenticated peer. Release
+this reference with `bpf_wg_peer_put()`.
 
-#### `struct wg_peer *bpf_wg_peer_allowedips_lookup(struct wg_device *wg, const void *addr, __u32 addr__sz)`
+Keypair lookup uses the incoming WireGuard receiver index and acquires a
+receiving keypair, or returns `NULL`. The `peer` output contains the parent
+peer's address for comparison with the AllowedIPs result; it is not a separate
+BPF peer reference. Release the keypair with `bpf_wg_keypair_put()`.
 
-- **Parameters:**
-  - `wg`: WireGuard device reference.
-  - `addr`: IPv4/IPv6 address pointer.
-  - `addr__sz`: Size of the address, 4 for IPv4 or 16 for IPv6.
-- **Returns:** Pointer to a `wg_peer` or `NULL` if not found.
-- **Description:**  
-  Look up the peer selected by WireGuard AllowedIPs for the supplied plaintext IP
-  address. The encrypt path uses the inner destination address; the decrypt path
-  uses the plaintext source address to validate that the packet belongs to the
-  decrypted peer. Must be released before the program exits with
-  [`bpf_wg_peer_put`](#void-bpf_wg_peer_putstruct-wg_peer-peer).
+Endpoint lookup fills the peer's outer UDP socket tuple and returns `AF_INET`
+or `AF_INET6`, or a negative error. The tuple size is implied by the address
+family; the API has no tuple-size argument.
 
-#### `struct wg_peer *bpf_wg_peer_hashtable_lookup(struct wg_device *wg, __le32 idx)`
+### Encryption, Decryption, And Checksums
 
-- **Parameters:**
-  - `wg`: WireGuard device reference.
-  - `idx`: Receiver index from the incoming WireGuard data header.
-- **Returns:** Pointer to a `wg_peer` or `NULL` if not found.
-- **Description:**  
-  Look up a peer from the receiver index in an incoming WireGuard data header.
-  Must be released before the program exits with
-  [`bpf_wg_peer_put`](#void-bpf_wg_peer_putstruct-wg_peer-peer).
+```c
+long bpf_wg_encrypt(struct bpf_dynptr *ptr, struct wg_peer *peer,
+                    __u64 *counter);
+long bpf_wg_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair,
+                    __u64 counter);
+__s64 bpf_dynptr_checksum(const struct bpf_dynptr *ptr, __u32 csum);
+```
 
-### Endpoint Lookup
+Create an XDP or SKB dynptr and bound it with `bpf_dynptr_adjust()`. Crypto bounds
+start after the WireGuard data header and include the payload, padding, and
+Poly1305 tag space. Encryption prepares headroom and trailer space first, then
+returns the remote receiver index as a nonnegative value and writes the nonce to
+`counter`. The BPF program writes these values into the WireGuard header.
 
-#### `int bpf_wg_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple, __u32 tuple__sz)`
+Decryption takes the nonce from the WireGuard header, validates authentication
+and the replay counter, and returns `0` on success. Crypto failures return a
+negative error, including `-EKEYEXPIRED` for expired session keys. The datapath
+then parses the plaintext and checks AllowedIPs before forwarding it.
 
-- **Parameters:**
-  - `peer`: WireGuard peer reference.
-  - `tuple`: Output buffer for the current UDP endpoint tuple.
-  - `tuple__sz`: Size of `tuple`.
-- **Returns:** Address family, `AF_INET` or `AF_INET6`, on success; negative error code otherwise.
-- **Description:**  
-  Read the current UDP endpoint tuple for a peer. The encrypt path uses this
-  tuple to build the outer UDP tunnel header.
+The checksum kfunc processes the bounded XDP/SKB dynptr and returns the partial
+checksum accumulated with `csum`, or a negative error. It is used to construct
+outgoing UDP tunnel checksums.
 
-### Encryption And Decryption
+### Explicit Traffic Accounting
 
-#### `int bpf_xdp_wg_encrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`<br>`int bpf_skb_wg_encrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`
+Patch `0005` exposes these additional kfuncs:
 
-- **Parameters:**
-  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
-  - `offset`: WireGuard header offset.
-  - `length`: WireGuard message length.
-  - `peer`: WireGuard peer reference.
-- **Returns:** `0` on success, negative error code otherwise.
-- **Description:**  
-  Encrypt packet data in-place with the peer sending key. The BPF program
-  prepares packet headroom/trailer space first, then passes the WireGuard header
-  offset and WireGuard message length to the kfunc.
+```c
+int bpf_wg_update_rx_stats(struct noise_keypair *keypair, __u32 message_len);
+int bpf_wg_update_tx_stats(struct wg_peer *peer, __u32 message_len);
+int bpf_wg_device_update_err_stats(struct wg_device *wg,
+                                  enum bpf_wg_device_error reason);
+```
 
-#### `int bpf_xdp_wg_decrypt(struct xdp_md *xdp_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`<br>`int bpf_skb_wg_decrypt(struct __sk_buff *skb_ctx, __u32 offset, __u32 length, struct wg_peer *peer)`
+`message_len` includes the WireGuard data header, padding, and authentication
+tag, and excludes UDP/IP headers. RX accounting updates peer and device totals
+after authentication, replay validation, inner-packet validation, and AllowedIPs
+checks. TX accounting updates peer totals and device packet/byte totals at the
+transmit commit point; device TX bytes exclude the WireGuard data header. A call
+before redirect counts a transmit attempt and cannot observe later output
+failures. Invalid message lengths return `-EINVAL` without changing counters.
 
-- **Parameters:**
-  - `xdp_ctx`/`skb_ctx`: XDP or TC program context.
-  - `offset`: WireGuard header offset.
-  - `length`: WireGuard message length.
-  - `peer`: WireGuard peer reference.
-- **Returns:** `0` on success, negative error code otherwise.
-- **Description:**  
-  Decrypt packet data in-place with the peer receiving key. The kfunc validates
-  the Poly1305 tag and WireGuard receive counter before the BPF program parses
-  the inner plaintext IP packet.
+Error accounting updates device-only error/drop counters for RX frame or length
+errors, TX errors, TX drops, or aborted transmission. Unknown categories return
+`-EINVAL`. These calls do not consume references and must avoid double-counting
+packets handled by native WireGuard.
+
+The current BPF datapath does not yet call these accounting kfuncs; successful
+crypto operations alone do not update peer/device traffic totals.
 
 ### Reference Release
 
-#### `void bpf_wg_device_put(struct wg_device *wg)`
+```c
+void bpf_wg_device_put(struct wg_device *wg);
+void bpf_wg_peer_put(struct wg_peer *peer);
+void bpf_wg_keypair_put(struct noise_keypair *keypair);
+```
 
-- **Parameters:**
-  - `wg`: WireGuard device reference acquired by a device lookup helper.
-- **Returns:** Nothing.
-- **Description:**  
-  Release a previously acquired WireGuard device reference.
-
-#### `void bpf_wg_peer_put(struct wg_peer *peer)`
-
-- **Parameters:**
-  - `peer`: WireGuard peer reference acquired by a peer lookup helper.
-- **Returns:** Nothing.
-- **Description:**  
-  Release a previously acquired WireGuard peer reference.
+Each helper releases the corresponding acquired reference.
 
 ## Program Flow
 
-The following flow chart shows how the BPF program uses the WireGuard kfuncs to
-encrypt or decrypt packets:
-
 ```mermaid
 flowchart TD
-    A([Parse L2/L3 packet headers]) --> B["bpf_fib_lookup()"]
+    A([Parse L2/L3 packet headers]) --> B{WireGuard data candidate?}
+    B -->|Yes| C["Optional outer conntrack/NAT; bpf_sk_lookup_udp()"]
+    C -->|Socket found| D["bpf_wg_device_get_from_sk()"]
+    D --> E["bpf_wg_keypair_hashtable_lookup()"]
+    E --> F["Bound payload dynptr; bpf_wg_decrypt()"]
+    F --> G["Parse inner packet; validate source AllowedIPs"]
+    G --> H[Optional inner conntrack/NAT]
+    H --> I["Route inner packet; remove tunnel headers/trailer"]
+    I --> R["bpf_redirect()"]
 
-    B --> |BPF_FIB_LKUP_RET_SUCCESS| C["bpf_{xdp,skb}_wg_device_get_by_index()"]
-    B --> |BPF_FIB_LKUP_RET_NOT_FWDED| D["bpf_{xdp,skb}_wg_device_get_by_port()"]
-
-    C --> C1["bpf_wg_peer_allowedips_lookup()"]
-    C1 --> C2["bpf_wg_endpoint_tuple_get()"]
-    C2 --> C3["bpf_adjust_packet()"]
-    C3 --> C4["bpf_{xdp,skb}_wg_encrypt()"]
-    C4 --> C5([Create outer UDP tunnel])
-
-    D --> D1["bpf_wg_peer_hashtable_lookup()"]
-    D1 --> D2["bpf_{xdp,skb}_wg_decrypt()"]
-    D2 --> D3([Parse inner IP packet])
-    D3 --> D4["bpf_wg_peer_allowedips_lookup()"]
-
-    C5 --> R["bpf_wg_peer_put()"]
-    D4 --> R
-    R --> S["bpf_wg_device_put()"]
-    S --> T["bpf_fib_lookup()"]
-    T --> U["bpf_redirect()"]
+    B -->|No| J[Optional inner conntrack/NAT]
+    C -->|No socket| J
+    J --> K["FIB lookup; bpf_xdp/skb_wg_device_get_by_index()"]
+    K --> L["Destination AllowedIPs; resolve endpoint tuple"]
+    L --> M["Adjust packet; bound dynptr; bpf_wg_encrypt()"]
+    M --> N[Write WireGuard data header]
+    N --> O[Optional outer conntrack/NAT]
+    O --> P[Create UDP/IP tunnel headers and checksums]
+    P --> Q[Route outer packet]
+    Q --> R
 ```
+
+The diagram shows the successful paths. Lookup failures and unsupported packets
+fall back to the network stack or are dropped as appropriate. Acquired socket,
+device, peer, and keypair references are released on their respective exit paths.
