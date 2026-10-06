@@ -1,0 +1,263 @@
+From 9ba830fc03751587cb0b07d203a0b193c282cd46 Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Tue, 6 Oct 2026 16:24:12 +0200
+Subject: [PATCH 5/5] wireguard: add eBPF kfuncs for explicit traffic
+ accounting
+
+Traffic handled through the WireGuard crypto kfuncs bypasses native
+peer and device accounting. Successful encryption or decryption alone
+does not indicate that a packet was transmitted or accepted.
+
+Add bpf_wg_update_rx_stats and bpf_wg_update_tx_stats so XDP and TC
+programs can explicitly update peer bytes and device bytes/packets at
+their receive acceptance or transmit commit point. Preserve the native
+data-packet byte definitions, including the difference between peer
+and device TX totals, and disable bottom halves around device updates.
+
+Add bpf_wg_device_update_err_stats for device-only error and drop
+accounting, selected by enum bpf_wg_device_error. Validate message
+lengths and error categories without modifying statistics on failure.
+
+Convert peer byte counters to atomic64_t and update initialization,
+native writers and netlink readers to avoid lost increments when BPF
+and native WireGuard paths run concurrently.
+---
+ drivers/net/wireguard/bpf.c     | 125 ++++++++++++++++++++++++++++++++
+ drivers/net/wireguard/netlink.c |   6 +-
+ drivers/net/wireguard/peer.c    |   2 +
+ drivers/net/wireguard/peer.h    |   3 +-
+ drivers/net/wireguard/receive.c |   2 +-
+ drivers/net/wireguard/socket.c  |   2 +-
+ 6 files changed, 135 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireguard/bpf.c b/drivers/net/wireguard/bpf.c
+index cfc28d00ab53..7e9d7adc147a 100644
+--- a/drivers/net/wireguard/bpf.c
++++ b/drivers/net/wireguard/bpf.c
+@@ -11,6 +11,13 @@
+ #include "socket.h"
+ #include "timers.h"
+ 
++enum bpf_wg_device_error {
++	BPF_WG_DEVICE_RX_FRAME_ERROR,
++	BPF_WG_DEVICE_RX_LENGTH_ERROR,
++	BPF_WG_DEVICE_TX_ERROR,
++	BPF_WG_DEVICE_TX_DROP,
++	BPF_WG_DEVICE_TX_ABORTED_ERROR,
++};
+ 
+ static struct wg_device *
+ bpf_wg_device_get_by_index(struct net *caller_net, u32 ifindex, s32 netns_id,
+@@ -402,6 +409,121 @@ bpf_wg_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair, u64 counte
+ 	return 0;
+ }
+ 
++/**
++ * bpf_wg_update_rx_stats() - Account for an accepted wireguard data packet.
++ * @keypair: Receiving keypair pointer acquired by a keypair lookup.
++ * @message_len: Full wireguard data message length, including the header,
++ *		padding and authentication tag, but excluding UDP and IP headers.
++ *
++ * Updates the authenticated peer's received bytes and the wireguard device's
++ * received bytes and packets. Call only after decryption, replay validation,
++ * inner packet validation and AllowedIPs checks succeed. Keepalives can also
++ * be accounted for. Do not call for packets accounted for by native wireguard.
++ * The keypair reference is not consumed.
++ *
++ * Return: 0 on success, or -EINVAL if @message_len is below the minimum data
++ * message length. No statistics are updated on error.
++ */
++__bpf_kfunc int
++bpf_wg_update_rx_stats(struct noise_keypair *keypair, u32 message_len)
++{
++	struct wg_peer *peer = keypair->entry.peer;
++
++	if (unlikely(message_len < MESSAGE_MINIMUM_LENGTH))
++		return -EINVAL;
++
++	local_bh_disable();
++	dev_sw_netstats_rx_add(peer->device->dev, message_len);
++	atomic64_add(message_len, &peer->rx_bytes);
++	local_bh_enable();
++	return 0;
++}
++
++/**
++ * bpf_wg_update_tx_stats() - Account for a transmitted wireguard data packet.
++ * @peer: Wireguard peer pointer acquired by a peer lookup.
++ * @message_len: Full wireguard data message length, including the header,
++ *		padding and authentication tag, but excluding UDP and IP headers.
++ *
++ * Updates the peer's transmitted bytes and the wireguard device's transmitted
++ * bytes and packets. Device bytes exclude the wireguard data header, matching
++ * native tunnel accounting. Call at the successful transmit commit point,
++ * not merely after encryption. When called before a redirect, this accounts
++ * for a transmit attempt and cannot observe subsequent output failures.
++ * Keepalives can also be accounted for. Do not call for packets accounted for
++ * by native wireguard. The peer reference is not consumed.
++ *
++ * Return: 0 on success, or -EINVAL if @message_len is below the minimum data
++ * message length. No statistics are updated on error.
++ */
++__bpf_kfunc int
++bpf_wg_update_tx_stats(struct wg_peer *peer, u32 message_len)
++{
++	if (unlikely(message_len < MESSAGE_MINIMUM_LENGTH))
++		return -EINVAL;
++
++	local_bh_disable();
++	dev_sw_netstats_tx_add(peer->device->dev, 1,
++			       message_len - sizeof(struct message_data));
++	atomic64_add(message_len, &peer->tx_bytes);
++	local_bh_enable();
++	return 0;
++}
++
++/**
++ * bpf_wg_device_update_err_stats() - Account for a wireguard device error.
++ * @wg: Wireguard device pointer acquired by a device lookup.
++ * @reason: Error category from &enum bpf_wg_device_error.
++ *
++ * Updates only device error or drop counters:
++ * BPF_WG_DEVICE_RX_FRAME_ERROR increments rx_errors and rx_frame_errors for an
++ * invalid inner packet type or unallowed source after authentication;
++ * BPF_WG_DEVICE_RX_LENGTH_ERROR increments rx_errors and rx_length_errors for an
++ * invalid inner packet size after authentication;
++ * BPF_WG_DEVICE_TX_ERROR increments tx_errors for an outbound packet rejection;
++ * BPF_WG_DEVICE_TX_DROP increments tx_dropped for a transmit drop;
++ * BPF_WG_DEVICE_TX_ABORTED_ERROR increments tx_errors and tx_aborted_errors for an
++ * aborted transmission.
++ *
++ * Authentication, replay and key expiry failures do not automatically map
++ * to these categories. Call only for failures observed by the BPF program,
++ * and do not account for errors already counted by native wireguard.
++ * Peer bytes and device success bytes and packets are not changed.
++ * The device reference is not consumed.
++ *
++ * Return: 0 on success, or -EINVAL for an unknown @reason. No statistics are
++ * updated on error.
++ */
++__bpf_kfunc int
++bpf_wg_device_update_err_stats(struct wg_device *wg,
++			       enum bpf_wg_device_error reason)
++{
++	switch (reason) {
++	case BPF_WG_DEVICE_RX_FRAME_ERROR:
++		DEV_STATS_INC(wg->dev, rx_errors);
++		DEV_STATS_INC(wg->dev, rx_frame_errors);
++		break;
++	case BPF_WG_DEVICE_RX_LENGTH_ERROR:
++		DEV_STATS_INC(wg->dev, rx_errors);
++		DEV_STATS_INC(wg->dev, rx_length_errors);
++		break;
++	case BPF_WG_DEVICE_TX_ERROR:
++		DEV_STATS_INC(wg->dev, tx_errors);
++		break;
++	case BPF_WG_DEVICE_TX_DROP:
++		DEV_STATS_INC(wg->dev, tx_dropped);
++		break;
++	case BPF_WG_DEVICE_TX_ABORTED_ERROR:
++		DEV_STATS_INC(wg->dev, tx_errors);
++		DEV_STATS_INC(wg->dev, tx_aborted_errors);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /**
+  * bpf_wg_device_put() - Release wireguard device.
+  * @bpf_wg: Wireguard device pointer.
+@@ -458,6 +580,9 @@ BTF_ID_FLAGS(func, bpf_wg_keypair_hashtable_lookup,
+ BTF_ID_FLAGS(func, bpf_wg_endpoint_tuple_get, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wg_encrypt, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wg_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_update_rx_stats, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_update_tx_stats, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wg_device_update_err_stats, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wg_device_put, KF_RELEASE)
+ BTF_ID_FLAGS(func, bpf_wg_peer_put, KF_RELEASE)
+ BTF_ID_FLAGS(func, bpf_wg_keypair_put, KF_RELEASE)
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index 1cd45857bf6b..4ce70cdcf03d 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -139,9 +139,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
+ 			    sizeof(last_handshake), &last_handshake) ||
+ 		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
+ 				peer->persistent_keepalive_interval) ||
+-		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
++		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES,
++				      atomic64_read(&peer->tx_bytes),
+ 				      WGPEER_A_UNSPEC) ||
+-		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
++		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES,
++				      atomic64_read(&peer->rx_bytes),
+ 				      WGPEER_A_UNSPEC) ||
+ 		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
+ 			goto err;
+diff --git a/drivers/net/wireguard/peer.c b/drivers/net/wireguard/peer.c
+index 1cb502a932e0..ab4020ecbd91 100644
+--- a/drivers/net/wireguard/peer.c
++++ b/drivers/net/wireguard/peer.c
+@@ -37,6 +37,8 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
+ 		goto err;
+ 
+ 	peer->device = wg;
++	atomic64_set(&peer->rx_bytes, 0);
++	atomic64_set(&peer->tx_bytes, 0);
+ 	wg_noise_handshake_init(&peer->handshake, &wg->static_identity,
+ 				public_key, preshared_key, peer);
+ 	peer->internal_id = atomic64_inc_return(&peer_counter);
+diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
+index 718fb42bdac7..a45d8d0c105a 100644
+--- a/drivers/net/wireguard/peer.h
++++ b/drivers/net/wireguard/peer.h
+@@ -10,6 +10,7 @@
+ #include "noise.h"
+ #include "cookie.h"
+ 
++#include <linux/atomic.h>
+ #include <linux/types.h>
+ #include <linux/netfilter.h>
+ #include <linux/spinlock.h>
+@@ -49,7 +50,7 @@ struct wg_peer {
+ 	struct work_struct transmit_handshake_work, clear_peer_work, transmit_packet_work;
+ 	struct cookie latest_cookie;
+ 	struct hlist_node pubkey_hash;
+-	u64 rx_bytes, tx_bytes;
++	atomic64_t rx_bytes, tx_bytes;
+ 	struct timer_list timer_retransmit_handshake, timer_send_keepalive;
+ 	struct timer_list timer_new_handshake, timer_zero_key_material;
+ 	struct timer_list timer_persistent_keepalive;
+diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
+index 50308d675ec2..ee74536e8675 100644
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -20,7 +20,7 @@
+ static void update_rx_stats(struct wg_peer *peer, size_t len)
+ {
+ 	dev_sw_netstats_rx_add(peer->device->dev, len);
+-	peer->rx_bytes += len;
++	atomic64_add(len, &peer->rx_bytes);
+ }
+ 
+ #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index a91a7ecf28eb..8cdbb2a831ad 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -180,7 +180,7 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 	else
+ 		dev_kfree_skb(skb);
+ 	if (likely(!ret))
+-		peer->tx_bytes += skb_len;
++		atomic64_add(skb_len, &peer->tx_bytes);
+ 	read_unlock_bh(&peer->endpoint_lock);
+ 
+ 	return ret;
+-- 
+2.55.0
+
