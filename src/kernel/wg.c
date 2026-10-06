@@ -33,18 +33,27 @@ int wg_encrypt_path(struct packet_data *pkt, struct packet_header *header,
         if (!conntrack_lookup_from_tuple(pkt, &endpoint.tuple,
                 endpoint.tuple_size, IPPROTO_UDP)) {
             //bpf_printk("conntrack pass after encryption");
-            return WG_ACTION_PASS;
+            ret = WG_ACTION_PASS;
+            goto bpf_wg_peer_put;
         }
     }
 
     if (!create_udp_tunnel(pkt, endpoint.family, &endpoint.tuple,
-            header->l3.offset, endpoint.tot_len))
-        return WG_ACTION_DROP;
+            header->l3.offset, endpoint.tot_len)) {
+        ret = WG_ACTION_DROP;
+        goto bpf_wg_peer_put;
+    }
 
     ret = output(pkt, endpoint.family, 0, header->l3.offset);
+    if (ret > 0)
+        bpf_wg_peer_update_tx_stats(endpoint.peer,
+            endpoint.tot_len - endpoint.iph_len - sizeof(struct udphdr));
+
     /*if (out <= 0)
         bpf_printk("%s: out = %d", __func__, out);*/
 
+bpf_wg_peer_put:
+    bpf_wg_peer_put(endpoint.peer);
     return ret;
 }
 

@@ -86,19 +86,25 @@ enum wg_action wg_decrypt_packet(struct packet_data *pkt, struct wg_decrypt_layo
 }
 
 __always_inline static
-bool wg_parse_inner_l3(struct packet_data *pkt, struct packet_header *header,
-                       struct wg_decrypt_layout *layout, struct wg_decrypt_inner *inner)
+bool wg_parse_inner_l3(struct packet_data *pkt, struct wg_decrypt_layout *layout,
+                       struct wg_decrypt_inner *inner)
 {
+    __u32 plain_len = layout->payload_len - CHACHA20POLY1305_AUTHTAG_SIZE;
+
     if (pkt->p + 1 > pkt->data_end)
         return false;
 
     switch (IP_VERSION(pkt->p)) {
         case 4:
+            if (plain_len < sizeof(struct iphdr))
+                return false;
             if (!parse_ipv4_header(pkt, &inner->l3))
                 return false;
             inner->addr_len = sizeof(struct in_addr);
             break;
         case 6:
+            if (plain_len < sizeof(struct ipv6hdr))
+                return false;
             if (!parse_ipv6_header(pkt, &inner->l3))
                 return false;
             inner->addr_len = sizeof(struct in6_addr);
@@ -107,9 +113,11 @@ bool wg_parse_inner_l3(struct packet_data *pkt, struct packet_header *header,
             return false;
     }
 
+    if (inner->l3.tot_len < inner->l3.hdr_len || inner->l3.tot_len > plain_len)
+        return false;
+
     inner->header_len = layout->header_len;
-    inner->trailer_len = header->l3.tot_len -
-        layout->header_len - inner->l3.tot_len;
+    inner->trailer_len = layout->payload_len - inner->l3.tot_len;
     return true;
 }
 
@@ -161,15 +169,23 @@ enum wg_action wg_decrypt(struct packet_data *pkt, struct packet_header *header,
         goto bpf_wg_device_put;
     }
 
-    if (!wg_parse_inner_l3(pkt, header, &layout, inner)) {
+    if (!wg_parse_inner_l3(pkt, &layout, inner)) {
         /* Workaround for !read_ok */
         bpf_wg_keypair_put(keypair);
         action = WG_ACTION_DROP;
         goto bpf_wg_device_put;
     }
 
-    if (!wg_source_allowed(wg_device, peer, inner))
+    if (!wg_source_allowed(wg_device, peer, inner)) {
+        /* Workaround for !read_ok */
+        bpf_wg_keypair_put(keypair);
         action = WG_ACTION_DROP;
+        goto bpf_wg_device_put;
+    }
+
+    /* Count the original message before trimming padding and the tag. */
+    bpf_wg_peer_update_rx_stats(keypair,
+        layout.payload_len + sizeof(struct wg_header));
 
 //bpf_wg_keypair_put:
     bpf_wg_keypair_put(keypair);

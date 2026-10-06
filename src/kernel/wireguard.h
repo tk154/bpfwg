@@ -56,6 +56,9 @@ int bpf_wg_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple
 long bpf_wg_encrypt(struct bpf_dynptr *ptr, struct wg_peer *peer, __u64 *counter) __ksym;
 long bpf_wg_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair, __u64 counter) __ksym;
 
+int bpf_wg_peer_update_rx_stats(struct noise_keypair *keypair, __u32 message_len) __ksym;
+int bpf_wg_peer_update_tx_stats(struct wg_peer *peer, __u32 message_len) __ksym;
+
 void bpf_wg_device_put(struct wg_device *wg) __ksym;
 void bpf_wg_peer_put(struct wg_peer *peer) __ksym;
 void bpf_wg_keypair_put(struct noise_keypair *keypair) __ksym;

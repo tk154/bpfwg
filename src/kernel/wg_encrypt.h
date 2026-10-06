@@ -16,6 +16,7 @@
 
 struct wg_encrypt_endpoint {
     struct bpf_sock_tuple tuple;
+    struct wg_peer *peer;
     __u64 tuple_size;
     sa_family_t family;
     __u16 tot_len;
@@ -85,12 +86,11 @@ enum wg_action wg_encrypt_lookup_peer(struct wg_device *wg_device,
 }
 
 __always_inline static
-bool wg_encrypt_resolve_endpoint(struct wg_peer *peer,
-                                 struct wg_encrypt_endpoint *endpoint)
+bool wg_encrypt_resolve_endpoint(struct wg_encrypt_endpoint *endpoint)
 {
     int ret;
 
-    ret = bpf_wg_endpoint_tuple_get(peer, &endpoint->tuple);
+    ret = bpf_wg_endpoint_tuple_get(endpoint->peer, &endpoint->tuple);
     switch (ret) {
         case AF_INET:
             endpoint->family = AF_INET;
@@ -162,7 +162,6 @@ enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
     struct wg_encrypt_layout layout;
     struct wg_device *wg_device;
     enum wg_action action;
-    struct wg_peer *peer;
     __le32 key_idx;
     __u64 counter;
 
@@ -170,11 +169,11 @@ enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
     if (action != WG_ACTION_REDIRECT)
         return action;
 
-    action = wg_encrypt_lookup_peer(wg_device, header, &peer);
+    action = wg_encrypt_lookup_peer(wg_device, header, &endpoint->peer);
     if (action != WG_ACTION_REDIRECT)
         goto bpf_wg_device_put;
 
-    if (!wg_encrypt_resolve_endpoint(peer, endpoint)) {
+    if (!wg_encrypt_resolve_endpoint(endpoint)) {
         action = WG_ACTION_PASS;
         goto bpf_wg_keypair_put;
     }
@@ -187,15 +186,20 @@ enum wg_action wg_encrypt(struct packet_data *pkt, struct packet_header *header,
         goto bpf_wg_keypair_put;
     }
 
-    action = wg_encrypt_packet(pkt, &layout, peer, &key_idx, &counter);
+    action = wg_encrypt_packet(pkt, &layout, endpoint->peer, &key_idx, &counter);
     if (action != WG_ACTION_REDIRECT)
         goto bpf_wg_keypair_put;
 
-    if (!push_wg_header(pkt, layout.wg_offset, key_idx, counter))
+    if (!push_wg_header(pkt, layout.wg_offset, key_idx, counter)) {
         action = WG_ACTION_DROP;
+        goto bpf_wg_keypair_put;
+    }
+
+    /* Transfer the peer reference to the caller until transmit accounting. */
+    goto bpf_wg_device_put;
 
 bpf_wg_keypair_put:
-    bpf_wg_peer_put(peer);
+    bpf_wg_peer_put(endpoint->peer);
 bpf_wg_device_put:
     bpf_wg_device_put(wg_device);
     return action;

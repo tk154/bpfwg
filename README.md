@@ -230,27 +230,28 @@ outgoing UDP tunnel checksums.
 Patch `0005` exposes these additional kfuncs:
 
 ```c
-int bpf_wg_update_rx_stats(struct noise_keypair *keypair, __u32 message_len);
-int bpf_wg_update_tx_stats(struct wg_peer *peer, __u32 message_len);
-int bpf_wg_device_update_err_stats(struct wg_device *wg,
-                                  enum bpf_wg_device_error reason);
+int bpf_wg_peer_update_rx_stats(struct noise_keypair *keypair, __u32 message_len);
+int bpf_wg_peer_update_tx_stats(struct wg_peer *peer, __u32 message_len);
 ```
 
 `message_len` includes the WireGuard data header, padding, and authentication
-tag, and excludes UDP/IP headers. RX accounting updates peer and device totals
+tag, and excludes UDP/IP headers. RX accounting updates peer received bytes
 after authentication, replay validation, inner-packet validation, and AllowedIPs
-checks. TX accounting updates peer totals and device packet/byte totals at the
-transmit commit point; device TX bytes exclude the WireGuard data header. A call
-before redirect counts a transmit attempt and cannot observe later output
-failures. Invalid message lengths return `-EINVAL` without changing counters.
+checks. TX accounting updates peer transmitted bytes at the transmit commit
+point. A call before redirect counts a transmit attempt and cannot observe
+later output failures. Lengths of 32 bytes or less, including empty-payload
+keepalives, return `-EINVAL` without changing counters, matching the crypto
+kfuncs' rejection of empty payloads.
 
-Error accounting updates device-only error/drop counters for RX frame or length
-errors, TX errors, TX drops, or aborted transmission. Unknown categories return
-`-EINVAL`. These calls do not consume references and must avoid double-counting
-packets handled by native WireGuard.
+These calls do not consume references and must avoid double-counting packets
+handled by native WireGuard. BPF traffic does not update WireGuard device
+packet, byte, error, or drop counters.
 
-The current BPF datapath does not yet call these accounting kfuncs; successful
-crypto operations alone do not update peer/device traffic totals.
+The datapath calls RX accounting after validating the authenticated inner
+packet and its source AllowedIPs, using the original message length before
+padding/tag removal. TX accounting runs after encapsulation and output lookup
+select a redirect, while the peer reference is still held.
+Conntrack and routing fallbacks are not counted as TX success.
 
 ### Reference Release
 
