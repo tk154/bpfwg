@@ -1,0 +1,235 @@
+From 511ddff0a3a8cf637fb5e8fcfdf0c24190e8b819 Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Tue, 6 Oct 2026 19:53:11 +0200
+Subject: [PATCH 2/2] wolfguard: add eBPF kfuncs for explicit peer traffic
+ accounting
+
+Traffic handled through the WolfGuard crypto kfuncs bypasses native peer
+accounting. Add bpf_wolf_peer_update_rx_stats and
+bpf_wolf_peer_update_tx_stats so XDP and TC programs can account for
+accepted receive traffic and committed transmits explicitly.
+
+Count the full data message, including the header, padding and AES-GCM
+authentication tag, while excluding UDP and IP headers. Reject empty
+keepalives and shorter messages without changing counters. Update only
+peer bytes; device byte, packet, error and drop counters stay unchanged.
+The accounting calls preserve their input references.
+
+Convert peer byte counters to atomic64_t and update initialization, native
+writers and netlink readers to preserve concurrent native/BPF increments.
+Document the explicit accounting responsibilities, message-length contract
+and unchanged device counters.
+---
+ README.md            | 23 ++++++++++++++++++--
+ kernel-src/bpf.c     | 51 ++++++++++++++++++++++++++++++++++++++++++++
+ kernel-src/netlink.c |  6 ++++--
+ kernel-src/peer.c    |  2 ++
+ kernel-src/peer.h    |  3 ++-
+ kernel-src/receive.c |  2 +-
+ kernel-src/socket.c  |  2 +-
+ 7 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index 3eb9ce8..b3a831c 100644
+--- a/README.md
++++ b/README.md
+@@ -41,7 +41,7 @@ WireGuard, but is still capable of saturating gigabit ethernet on modern CPUs.
+ 
+ ## eBPF data-plane API
+ 
+-WolfGuard exposes 11 kfuncs to XDP (`BPF_PROG_TYPE_XDP`) and TC
++WolfGuard exposes 13 kfuncs to XDP (`BPF_PROG_TYPE_XDP`) and TC
+ (`BPF_PROG_TYPE_SCHED_CLS`) programs on the modified kernel that provides
+ `bpf_dynptr_to_sgvec()`, `__bpf_dynptr_size()`, and the GPL export of
+ `__bpf_dynptr_is_rdonly()`. Stock kernels without these additions are not
+@@ -67,13 +67,15 @@ errors abort module initialization and unwind the device and netlink setup.
+ | `bpf_wolf_endpoint_tuple_get` | Read the peer's IPv4 or IPv6 outer address and port tuple. |
+ | `bpf_wolf_encrypt` | Encrypt a bounded packet dynptr in place with AES-GCM; return the remote index and nonce counter. |
+ | `bpf_wolf_decrypt` | Authenticate and decrypt a bounded packet dynptr in place and validate its nonce against the replay window. |
++| `bpf_wolf_peer_update_rx_stats` | Update peer RX bytes for an accepted data message. |
++| `bpf_wolf_peer_update_tx_stats` | Update peer TX bytes for a committed transmit. |
+ 
+ The API preserves the signatures, verifier flags, and reference ownership of
+ its WireGuard counterpart, with `wg` replaced by `wolf` in the kfunc names.
+ Programs must release every acquired device, peer, and keypair on every path.
+ Keypair lookup's peer address is for comparison against an independently
+ acquired allowed-IP peer; it is not a separately acquired BPF peer pointer.
+-Crypto and endpoint calls do not consume their input references.
++Crypto, endpoint, and statistics calls do not consume their input references.
+ Device and socket lookups recognize WolfGuard's own driver, allowing WireGuard
+ and WolfGuard to coexist.
+ 
+@@ -98,6 +100,23 @@ as in the source API. A crypto error can leave the packet modified; discard it.
+ Neither crypto call increments traffic statistics. See `kernel-src/bpf.c` for
+ complete signatures and error codes.
+ 
++### Explicit accounting
++
++Pass the complete data-message length, including the data header, padding,
++and authentication tag, but excluding outer UDP/IP headers. Call RX accounting
++only after authentication, replay validation, allowed-source validation, and
++acceptance of the inner packet. Call TX accounting at the successful transmit
++commit point. Before a redirect this records a transmit attempt, since the
++program cannot observe subsequent output failures. Do not count traffic that
++continues through native WolfGuard accounting. Empty keepalives are not
++supported by these calls.
++
++RX and TX each increment only the corresponding peer byte counter by the full
++message length. Device byte, packet, error, and drop counters are unchanged.
++Lengths at or below `MESSAGE_MINIMUM_LENGTH` (32 bytes, including an empty
++keepalive) return `-EINVAL` without changing statistics. Peer byte counters use
++atomic updates in both the BPF and native paths to preserve concurrent updates.
++
+ ## Building and Installation
+ 
+ Below are two sets of instructions, the first for building from non-FIPS
+diff --git a/kernel-src/bpf.c b/kernel-src/bpf.c
+index 5afb4fd..089332a 100644
+--- a/kernel-src/bpf.c
++++ b/kernel-src/bpf.c
+@@ -403,6 +403,55 @@ bpf_wolf_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair, u64 coun
+ 	return 0;
+ }
+ 
++/**
++ * bpf_wolf_peer_update_rx_stats() - Account for an accepted wolfguard data packet.
++ * @keypair: Receiving keypair pointer acquired by a keypair lookup.
++ * @message_len: Full wolfguard data message length, including the header,
++ *		padding and authentication tag, but excluding UDP and IP headers.
++ *
++ * Updates the authenticated peer's received bytes. Call only after
++ * decryption, replay validation, inner packet validation and AllowedIPs checks
++ * succeed. Keepalives are not supported. Do not call for packets
++ * accounted for by native wolfguard. The keypair reference is not consumed.
++ *
++ * Return: 0 on success, or -EINVAL if @message_len is too short to contain
++ * a nonempty payload. No statistics are updated on error.
++ */
++__bpf_kfunc int
++bpf_wolf_peer_update_rx_stats(struct noise_keypair *keypair, u32 message_len)
++{
++	struct wg_peer *peer = keypair->entry.peer;
++
++	if (unlikely(message_len <= MESSAGE_MINIMUM_LENGTH))
++		return -EINVAL;
++
++	atomic64_add(message_len, &peer->rx_bytes);
++	return 0;
++}
++
++/**
++ * bpf_wolf_peer_update_tx_stats() - Account for a transmitted wolfguard data packet.
++ * @peer: WolfGuard peer pointer acquired by a peer lookup.
++ * @message_len: Full wolfguard data message length, including the header,
++ *		padding and authentication tag, but excluding UDP and IP headers.
++ *
++ * Updates the peer's transmitted bytes. Call at the successful transmit
++ * commit point. Keepalives are not supported. Do not call for packets
++ * accounted for by native wolfguard. The peer reference is not consumed.
++ *
++ * Return: 0 on success, or -EINVAL if @message_len is too short to contain
++ * a nonempty payload. No statistics are updated on error.
++ */
++__bpf_kfunc int
++bpf_wolf_peer_update_tx_stats(struct wg_peer *peer, u32 message_len)
++{
++	if (unlikely(message_len <= MESSAGE_MINIMUM_LENGTH))
++		return -EINVAL;
++
++	atomic64_add(message_len, &peer->tx_bytes);
++	return 0;
++}
++
+ /**
+  * bpf_wolf_device_put() - Release wolfguard device.
+  * @wg: WolfGuard device pointer.
+@@ -459,6 +508,8 @@ BTF_ID_FLAGS(func, bpf_wolf_keypair_hashtable_lookup,
+ BTF_ID_FLAGS(func, bpf_wolf_endpoint_tuple_get, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wolf_encrypt, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wolf_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_peer_update_rx_stats, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_peer_update_tx_stats, KF_TRUSTED_ARGS)
+ BTF_ID_FLAGS(func, bpf_wolf_device_put, KF_RELEASE)
+ BTF_ID_FLAGS(func, bpf_wolf_peer_put, KF_RELEASE)
+ BTF_ID_FLAGS(func, bpf_wolf_keypair_put, KF_RELEASE)
+diff --git a/kernel-src/netlink.c b/kernel-src/netlink.c
+index d8ded0c..c5cf5a2 100644
+--- a/kernel-src/netlink.c
++++ b/kernel-src/netlink.c
+@@ -144,9 +144,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
+ 			    sizeof(last_handshake), &last_handshake) ||
+ 		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
+ 				peer->persistent_keepalive_interval) ||
+-		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
++		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES,
++				      atomic64_read(&peer->tx_bytes),
+ 				      WGPEER_A_UNSPEC) ||
+-		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
++		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES,
++				      atomic64_read(&peer->rx_bytes),
+ 				      WGPEER_A_UNSPEC) ||
+ 		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
+ 			goto err;
+diff --git a/kernel-src/peer.c b/kernel-src/peer.c
+index dee445b..ff3519b 100644
+--- a/kernel-src/peer.c
++++ b/kernel-src/peer.c
+@@ -35,6 +35,8 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
+ 	if (unlikely(!peer))
+ 		return ERR_PTR(ret);
+ 	peer->device = wg;
++	atomic64_set(&peer->rx_bytes, 0);
++	atomic64_set(&peer->tx_bytes, 0);
+ 
+ 	wg_noise_handshake_init(&peer->handshake, &wg->static_identity,
+ 				public_key, preshared_key, peer);
+diff --git a/kernel-src/peer.h b/kernel-src/peer.h
+index 2c75c3c..529b8e5 100644
+--- a/kernel-src/peer.h
++++ b/kernel-src/peer.h
+@@ -12,6 +12,7 @@
+ #include "noise.h"
+ #include "cookie.h"
+ 
++#include <linux/atomic.h>
+ #include <linux/types.h>
+ #include <linux/netfilter.h>
+ #include <linux/spinlock.h>
+@@ -60,7 +61,7 @@ struct wg_peer {
+ 	struct work_struct transmit_handshake_work, clear_peer_work;
+ 	struct cookie latest_cookie;
+ 	struct hlist_node pubkey_hash;
+-	u64 rx_bytes, tx_bytes;
++	atomic64_t rx_bytes, tx_bytes;
+ 	struct timer_list timer_retransmit_handshake, timer_send_keepalive;
+ 	struct timer_list timer_new_handshake, timer_zero_key_material;
+ 	struct timer_list timer_persistent_keepalive;
+diff --git a/kernel-src/receive.c b/kernel-src/receive.c
+index ff77cb1..75b3ba5 100644
+--- a/kernel-src/receive.c
++++ b/kernel-src/receive.c
+@@ -33,7 +33,7 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
+ 	++tstats->rx_packets;
+ 	tstats->rx_bytes += len;
+ #endif
+-	peer->rx_bytes += len;
++	atomic64_add(len, &peer->rx_bytes);
+ 	u64_stats_update_end(&tstats->syncp);
+ 	put_cpu_ptr(tstats);
+ }
+diff --git a/kernel-src/socket.c b/kernel-src/socket.c
+index 885d0fd..93ef38d 100644
+--- a/kernel-src/socket.c
++++ b/kernel-src/socket.c
+@@ -207,7 +207,7 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 	else
+ 		dev_kfree_skb(skb);
+ 	if (likely(!ret))
+-		peer->tx_bytes += skb_len;
++		atomic64_add(skb_len, &peer->tx_bytes);
+ 	read_unlock_bh(&peer->endpoint_lock);
+ 
+ 	return ret;
+-- 
+2.55.0
+

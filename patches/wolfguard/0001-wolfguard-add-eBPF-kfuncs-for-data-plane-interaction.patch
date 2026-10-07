@@ -1,0 +1,878 @@
+From 9931721cb9bab61e94e2b5425a97c0fa72aa83a9 Mon Sep 17 00:00:00 2001
+From: Til Kaiser <mail@tk154.de>
+Date: Tue, 6 Oct 2026 19:52:35 +0200
+Subject: [PATCH 1/2] wolfguard: add eBPF kfuncs for data plane interaction
+
+Expose eleven kfuncs for XDP and TC device, peer and receiving-keypair
+lookups, endpoint tuples, reference release, and in-place AES-GCM crypto.
+Preserve the WireGuard API signatures, verifier flags and ownership rules
+under the bpf_wolf namespace while using WolfGuard's crypto wrappers.
+
+Share native nonce allocation, replay validation and key-refresh timers.
+Add BTF-gated registration with initialization cleanup and a disabled-API
+stub for external-module builds. Update the existing replay selftest to
+use the exposed validation helper.
+
+Document the modified-kernel requirements and packet/reference contracts.
+---
+ README.md                     |  59 +++++
+ kernel-src/Kbuild             |   7 +
+ kernel-src/allowedips.c       |  11 +
+ kernel-src/allowedips.h       |   3 +
+ kernel-src/bpf.c              | 481 ++++++++++++++++++++++++++++++++++
+ kernel-src/bpf.h              |  19 ++
+ kernel-src/device.c           |  17 ++
+ kernel-src/device.h           |   2 +
+ kernel-src/main.c             |   7 +
+ kernel-src/netlink.c          |   2 +-
+ kernel-src/noise.h            |   5 +
+ kernel-src/receive.c          |   8 +-
+ kernel-src/selftest/counter.c |   2 +-
+ kernel-src/send.c             |   4 +-
+ kernel-src/socket.c           |  16 ++
+ kernel-src/socket.h           |   2 +
+ 16 files changed, 637 insertions(+), 8 deletions(-)
+ create mode 100644 kernel-src/bpf.c
+ create mode 100644 kernel-src/bpf.h
+
+diff --git a/README.md b/README.md
+index 98fcec0..3eb9ce8 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,65 @@ acceleration of the AES-256-GCM and SHA2-256 operations.  Without
+ `--enable-intelasm`, WolfGuard is slightly slower than CPU-accelerated
+ WireGuard, but is still capable of saturating gigabit ethernet on modern CPUs.
+ 
++## eBPF data-plane API
++
++WolfGuard exposes 11 kfuncs to XDP (`BPF_PROG_TYPE_XDP`) and TC
++(`BPF_PROG_TYPE_SCHED_CLS`) programs on the modified kernel that provides
++`bpf_dynptr_to_sgvec()`, `__bpf_dynptr_size()`, and the GPL export of
++`__bpf_dynptr_is_rdonly()`. Stock kernels without these additions are not
++supported by this API. Build the target kernel first so its `vmlinux` and
++`Module.symvers` match the modified sources.
++
++External-module builds require `CONFIG_DEBUG_INFO_BTF_MODULES=y`; built-in
++builds require `CONFIG_DEBUG_INFO_BTF=y`. When the applicable BTF option is
++disabled, WolfGuard builds without the API. For external builds, no
++`CONFIG_WOLFGUARD` setting in the target kernel is needed. Kfunc registration
++errors abort module initialization and unwind the device and netlink setup.
++
++| Kfunc | Purpose |
++| :---- | :------ |
++| `bpf_xdp_wolf_device_get_by_index` | Acquire a device from an XDP context by interface index and namespace ID. |
++| `bpf_skb_wolf_device_get_by_index` | Acquire a device from a TC context by interface index and namespace ID. |
++| `bpf_wolf_device_get_from_sk` | Acquire the device associated with a WolfGuard UDP socket. |
++| `bpf_wolf_device_put` | Release an acquired device. |
++| `bpf_wolf_peer_allowedips_lookup` | Acquire a peer for a 4-byte IPv4 or 16-byte IPv6 address in network byte order. |
++| `bpf_wolf_peer_put` | Release an acquired peer. |
++| `bpf_wolf_keypair_hashtable_lookup` | Acquire a receiving keypair by its little-endian receiver index and return its peer address. |
++| `bpf_wolf_keypair_put` | Release the receiving keypair and its associated peer reference. |
++| `bpf_wolf_endpoint_tuple_get` | Read the peer's IPv4 or IPv6 outer address and port tuple. |
++| `bpf_wolf_encrypt` | Encrypt a bounded packet dynptr in place with AES-GCM; return the remote index and nonce counter. |
++| `bpf_wolf_decrypt` | Authenticate and decrypt a bounded packet dynptr in place and validate its nonce against the replay window. |
++
++The API preserves the signatures, verifier flags, and reference ownership of
++its WireGuard counterpart, with `wg` replaced by `wolf` in the kfunc names.
++Programs must release every acquired device, peer, and keypair on every path.
++Keypair lookup's peer address is for comparison against an independently
++acquired allowed-IP peer; it is not a separately acquired BPF peer pointer.
++Crypto and endpoint calls do not consume their input references.
++Device and socket lookups recognize WolfGuard's own driver, allowing WireGuard
++and WolfGuard to coexist.
++
++### Packet contract
++
++Construct a writable XDP or SKB dynptr and use `bpf_dynptr_adjust()` to restrict
++it to the padded payload plus authentication tag, excluding the data-message
++header and outer UDP/IP headers. Encryption requires an aligned length that
++is a multiple of `MESSAGE_PADDING_MULTIPLE` (16), with space for the 16-byte
++AES-GCM tag. Both crypto kfuncs require a length greater than the tag alone,
++matching the source WireGuard API. The caller supplies padding and tag space
++and constructs or removes protocol headers. Decryption leaves the tag and
++padding in the buffer; the caller adjusts the accepted inner packet length.
++A cloned SKB is rejected by the scatterlist helper.
++
++Encryption allocates the nonce from the native session's atomic counter and
++returns the remote receiver index in its original little-endian representation.
++Decryption expects a host-order nonce, authenticates before replay validation,
++and shares the native replay window. Expired keys are rejected. On successful
++crypto operations, key-refresh and receive authentication timers are updated
++as in the source API. A crypto error can leave the packet modified; discard it.
++Neither crypto call increments traffic statistics. See `kernel-src/bpf.c` for
++complete signatures and error codes.
++
+ ## Building and Installation
+ 
+ Below are two sets of instructions, the first for building from non-FIPS
+diff --git a/kernel-src/Kbuild b/kernel-src/Kbuild
+index 6cae2db..9fd3408 100644
+--- a/kernel-src/Kbuild
++++ b/kernel-src/Kbuild
+@@ -16,6 +16,13 @@ wolfguard-y := main.o noise.o device.o peer.o timers.o queueing.o send.o receive
+ 
+ include $(src)/compat/Kbuild.include
+ 
++# External modules have no CONFIG_WOLFGUARD entry in the target kernel.
++ifeq ($(if $(KBUILD_EXTMOD),m,$(CONFIG_WOLFGUARD)),m)
++wolfguard-$(CONFIG_DEBUG_INFO_BTF_MODULES) += bpf.o
++else ifeq ($(CONFIG_WOLFGUARD),y)
++wolfguard-$(CONFIG_DEBUG_INFO_BTF) += bpf.o
++endif
++
+ obj-$(if $(KBUILD_EXTMOD),m,$(CONFIG_WOLFGUARD)) := wolfguard.o
+ 
+ ifndef WOLFSSL_ROOT
+diff --git a/kernel-src/allowedips.c b/kernel-src/allowedips.c
+index 149af90..11e5717 100644
+--- a/kernel-src/allowedips.c
++++ b/kernel-src/allowedips.c
+@@ -387,4 +387,15 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 	return NULL;
+ }
+ 
++/* Returns a strong reference to a peer */
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len)
++{
++	if (addr_len == 4)
++		return lookup(table->root4, 32, addr);
++	else if (addr_len == 16)
++		return lookup(table->root6, 128, addr);
++	return NULL;
++}
++
+ #include "selftest/allowedips.c"
+diff --git a/kernel-src/allowedips.h b/kernel-src/allowedips.h
+index 5458bbc..cc4d162 100644
+--- a/kernel-src/allowedips.h
++++ b/kernel-src/allowedips.h
+@@ -58,4 +58,7 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ bool wg_allowedips_selftest(void);
+ #endif
+ 
++struct wg_peer *wg_allowedips_lookup_bpf(struct allowedips *table,
++					 const void *addr, u32 addr_len);
++
+ #endif /* _WG_ALLOWEDIPS_H */
+diff --git a/kernel-src/bpf.c b/kernel-src/bpf.c
+new file mode 100644
+index 0000000..5afb4fd
+--- /dev/null
++++ b/kernel-src/bpf.c
+@@ -0,0 +1,481 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/netdevice.h>
++#include <net/xdp.h>
++
++#include "bpf.h"
++#include "device.h"
++#include "peer.h"
++#include "socket.h"
++#include "timers.h"
++
++static struct wg_device *
++bpf_wolf_device_get_by_index(struct net *caller_net, u32 ifindex, s32 netns_id,
++			   int *err)
++{
++	struct wg_device *wg;
++	struct net *net;
++
++	if (unlikely(!ifindex || netns_id < BPF_F_CURRENT_NETNS)) {
++		*err = -EINVAL;
++		return NULL;
++	}
++
++	if (netns_id >= 0) {
++		net = get_net_ns_by_id(caller_net, netns_id);
++		if (unlikely(!net)) {
++			*err = -ENOENT;
++			return NULL;
++		}
++
++		wg = wg_device_get_by_index(net, ifindex);
++		put_net(net);
++	} else {
++		net = caller_net;
++		wg = wg_device_get_by_index(net, ifindex);
++	}
++
++	if (unlikely(!wg)) {
++		*err = -ENODEV;
++		return NULL;
++	}
++
++	*err = 0;
++	return wg;
++}
++
++__bpf_kfunc_start_defs();
++
++/**
++ * bpf_xdp_wolf_device_get_by_index() - Get wolfguard device by ifindex.
++ * @xdp_ctx: XDP context pointer.
++ * @ifindex: Interface index.
++ * @netns_id: Network namespace ID or BPF_F_CURRENT_NETNS.
++ * @err: Pointer to error value.
++ *
++ * Retrieves a reference to the wolfguard device associated with the given
++ * @ifindex from an XDP program. The device reference must be released using
++ * bpf_wolf_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, with @err set to one of the following:
++ *   -EINVAL - @ifindex is zero or @netns_id is less than BPF_F_CURRENT_NETNS
++ *   -ENOENT - No network namespace found for @netns_id
++ *   -ENODEV - No wolfguard device found for @ifindex
++ */
++__bpf_kfunc struct wg_device *
++bpf_xdp_wolf_device_get_by_index(struct xdp_md *xdp_ctx, u32 ifindex, s32 netns_id, int *err)
++{
++	struct xdp_buff *ctx = (struct xdp_buff *)xdp_ctx;
++	struct net *caller_net = dev_net(ctx->rxq->dev);
++
++	return bpf_wolf_device_get_by_index(caller_net, ifindex, netns_id, err);
++}
++
++/**
++ * bpf_skb_wolf_device_get_by_index() - Get wolfguard device by ifindex.
++ * @skb_ctx: SKB context pointer.
++ * @ifindex: Interface index.
++ * @netns_id: Network namespace ID or BPF_F_CURRENT_NETNS.
++ * @err: Pointer to error value.
++ *
++ * Retrieves a reference to the wolfguard device associated with the given
++ * @ifindex from a TC or socket-related program. The device reference must
++ * be released using bpf_wolf_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, with @err set to one of the following:
++ *   -EINVAL - @ifindex is zero or @netns_id is less than BPF_F_CURRENT_NETNS
++ *   -ENOENT - No network namespace found for @netns_id
++ *   -ENODEV - No wolfguard device found for @ifindex
++ */
++__bpf_kfunc struct wg_device *
++bpf_skb_wolf_device_get_by_index(struct __sk_buff *skb_ctx, u32 ifindex, s32 netns_id, int *err)
++{
++	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
++	struct net *caller_net;
++
++	caller_net = skb->dev ? dev_net(skb->dev) : sock_net(skb->sk);
++	return bpf_wolf_device_get_by_index(caller_net, ifindex, netns_id, err);
++}
++
++/**
++ * bpf_wolf_device_get_from_sk() - Get wolfguard device from socket.
++ * @sk: Socket pointer.
++ *
++ * Retrieves a reference to the wolfguard device associated with the given
++ * socket @sk. The device reference must be released using bpf_wolf_device_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_device on success.
++ * * NULL on error, if @sk is not a wolfguard socket.
++ */
++__bpf_kfunc struct wg_device *
++bpf_wolf_device_get_from_sk(struct sock *sk)
++{
++	return wg_socket_device_get_from_sk(sk);
++}
++
++/**
++ * bpf_wolf_peer_allowedips_lookup() - Lookup wolfguard peer by allowed IPs.
++ * @wg: WolfGuard device pointer.
++ * @addr: IP address to lookup.
++ * @addr__sz: Size of @addr.
++ *
++ * Looks up a wolfguard peer based on the provided IP address @addr. This is
++ * typically used to find the peer for outbound traffic before encrypting,
++ * but can also be used to check if the decrypted source IP is in the
++ * allowed IPs list. The returned peer reference must be released using
++ * bpf_wolf_peer_put().
++ *
++ * Return:
++ * * Pointer to &struct wg_peer on success.
++ * * NULL if the IP is not routed through the WolfGuard device or the peer is dead.
++ */
++__bpf_kfunc struct wg_peer *
++bpf_wolf_peer_allowedips_lookup(struct wg_device *wg, const void *addr,
++			      u32 addr__sz)
++{
++	struct wg_peer *peer;
++
++	peer = wg_allowedips_lookup_bpf(&wg->peer_allowedips, addr, addr__sz);
++	if (unlikely(!peer))
++		return NULL;
++
++	if (unlikely(READ_ONCE(peer->is_dead))) {
++		wg_peer_put(peer);
++		return NULL;
++	}
++
++	return peer;
++}
++
++/**
++ * bpf_wolf_keypair_hashtable_lookup() - Lookup wolfguard keypair by hashtable index.
++ * @wg: WolfGuard device pointer.
++ * @key_idx: Key index in hashtable.
++ * @peer_addr: Pointer to be populated with the peer address.
++ *
++ * Looks up a wolfguard peer and its current receiving keypair based on the
++ * receiver index @key_idx. This is typically used to find the decryption keys
++ * for inbound wolfguard data packets. @peer_addr is populated with the peer
++ * address, which can be used to verify cryptokey routing by comparing it
++ * against the peer returned from bpf_wolf_peer_allowedips_lookup().
++ * The returned keypair reference must be released using bpf_wolf_keypair_put().
++ *
++ * Return:
++ * * Pointer to &struct noise_keypair on success.
++ * * NULL if no keypair was found or the peer is dead.
++ */
++__bpf_kfunc struct noise_keypair *
++bpf_wolf_keypair_hashtable_lookup(struct wg_device *wg, __le32 key_idx,
++				unsigned long *peer_addr)
++{
++	struct noise_keypair *keypair;
++	struct wg_peer *peer = NULL;
++
++	rcu_read_lock_bh();
++	keypair = (struct noise_keypair *)wg_index_hashtable_lookup(
++		wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, key_idx, &peer);
++	keypair = wg_noise_keypair_get(keypair);
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair))
++		goto err_keypair;
++	if (unlikely(READ_ONCE(peer->is_dead)))
++		goto err;
++
++	*peer_addr = (unsigned long)peer;
++	return keypair;
++
++err:
++	wg_noise_keypair_put(keypair, false);
++err_keypair:
++	wg_peer_put(peer);
++	return NULL;
++}
++
++/**
++ * bpf_wolf_endpoint_tuple_get() - Get wolfguard endpoint tuple.
++ * @peer: WolfGuard peer pointer.
++ * @tuple: Pointer to a bpf_sock_tuple to write to.
++ *
++ * Retrieves the socket tuple (source and destination IPs and ports) associated
++ * with the wolfguard @peer's endpoint.
++ *
++ * Return:
++ * * Address family on success.
++ * * Error code on failure:
++ *   -EDESTADDRREQ - Endpoint address family is not AF_INET or AF_INET6
++ */
++__bpf_kfunc int
++bpf_wolf_endpoint_tuple_get(struct wg_peer *peer, struct bpf_sock_tuple *tuple)
++{
++	u16 sport = htons(peer->device->incoming_port);
++	struct endpoint *endpoint = &peer->endpoint;
++	int ret;
++
++	read_lock_bh(&peer->endpoint_lock);
++	switch (endpoint->addr.sa_family) {
++	case AF_INET:
++		tuple->ipv4.daddr = endpoint->addr4.sin_addr.s_addr;
++		tuple->ipv4.dport = endpoint->addr4.sin_port;
++		tuple->ipv4.saddr = endpoint->src4.s_addr;
++		tuple->ipv4.sport = sport;
++		ret = AF_INET;
++		break;
++	case AF_INET6:
++		memcpy(tuple->ipv6.daddr, &endpoint->addr6.sin6_addr,
++		       sizeof(tuple->ipv6.daddr));
++		memcpy(tuple->ipv6.saddr, &endpoint->src6,
++		       sizeof(tuple->ipv6.saddr));
++		tuple->ipv6.dport = endpoint->addr6.sin6_port;
++		tuple->ipv6.sport = sport;
++		ret = AF_INET6;
++		break;
++	default:
++		ret = -EDESTADDRREQ;
++	}
++	read_unlock_bh(&peer->endpoint_lock);
++
++	return ret;
++}
++
++/**
++ * bpf_wolf_encrypt() - Encrypt a wolfguard packet.
++ * @ptr: Pointer to the bpf_dynptr containing the packet data.
++ * @peer: WolfGuard peer pointer.
++ * @counter: Pointer to be populated with the used nonce counter.
++ *
++ * Encrypts the payload of the packet referenced by @ptr in-place using the
++ * current sending key from @peer's session. The exact bounds of the packet
++ * to encrypt are extracted natively from the provided dynptr. The incremented
++ * counter used as the nonce is returned in @counter.
++ *
++ * Return:
++ * * The remote_index (>= 0) on success.
++ * * Negative error code on failure:
++ *   -EINVAL
++ *     - The dynptr was not initialized correctly
++ *     - The dynptr is read-only
++ *     - The dynptr length is not a multiple of 16
++ *   -E2BIG - The dynptr length is out of bounds
++ *   -EOPNOTSUPP - The dynptr is not of type XDP or SKB
++ *   -EMSGSIZE - The packet exceeds the maximum allowed size or is too fragmented
++ *   -EKEYEXPIRED - The sending counter reached REJECT_AFTER_MESSAGES
++ *   -EBADMSG - The encryption operation failed
++ */
++__bpf_kfunc long
++bpf_wolf_encrypt(struct bpf_dynptr *ptr, struct wg_peer *peer, u64 *counter)
++{
++	struct bpf_dynptr_kern *ptr_kern = (struct bpf_dynptr_kern *)ptr;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	struct noise_keypair *keypair;
++	size_t plaintext_len;
++	u32 length;
++	u64 nonce;
++	long ret;
++
++	if (unlikely(!ptr_kern->data || __bpf_dynptr_is_rdonly(ptr_kern)))
++		return -EINVAL;
++
++	length = __bpf_dynptr_size(ptr_kern);
++	if (unlikely(length <= noise_encrypted_len(0) ||
++			!IS_ALIGNED(length, MESSAGE_PADDING_MULTIPLE)))
++		return -EINVAL;
++
++	rcu_read_lock_bh();
++	keypair = wg_noise_keypair_get(
++		rcu_dereference_bh(peer->keypairs.current_keypair));
++	rcu_read_unlock_bh();
++
++	if (unlikely(!keypair || !READ_ONCE(keypair->sending.is_valid))) {
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	if (unlikely(wg_birthdate_has_expired(keypair->sending.birthdate,
++					      REJECT_AFTER_TIME))) {
++		WRITE_ONCE(keypair->sending.is_valid, false);
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	nonce = atomic64_inc_return(&keypair->sending_counter) - 1;
++	if (unlikely(nonce >= REJECT_AFTER_MESSAGES)) {
++		WRITE_ONCE(keypair->sending.is_valid, false);
++		ret = -EKEYEXPIRED;
++		goto out;
++	}
++
++	ret = bpf_dynptr_to_sgvec(ptr_kern, sg, ARRAY_SIZE(sg));
++	if (unlikely(ret < 0))
++		goto out;
++
++	plaintext_len = length - noise_encrypted_len(0);
++	if (unlikely(!wc_AesGcm_encrypt_sg_inplace(sg,
++			plaintext_len, NULL, 0, nonce, keypair->sending.key,
++			sizeof(keypair->sending.key)))) {
++		ret = -EBADMSG;
++		goto out;
++	}
++
++	wg_noise_send_keep_key_fresh(peer);
++	ret = (long)keypair->remote_index;
++	*counter = nonce;
++
++out:
++	wg_noise_keypair_put(keypair, false);
++	return ret;
++}
++
++/**
++ * bpf_wolf_decrypt() - Decrypt a wolfguard packet.
++ * @ptr: Pointer to the bpf_dynptr containing the packet data.
++ * @keypair: WolfGuard keypair pointer.
++ * @counter: Nonce counter used for decryption.
++ *
++ * Decrypts the payload of the packet referenced by @ptr in-place using the
++ * provided @keypair. The exact bounds of the packet to decrypt are extracted
++ * natively from the provided dynptr. The @counter is used as the nonce and
++ * is checked if it is valid.
++ *
++ * Return:
++ * * 0 on success.
++ * * Error code on failure:
++ *   -EINVAL
++ *     - The dynptr was not initialized correctly
++ *     - The dynptr is read-only
++ *     - The SKB is cloned
++ *   -E2BIG - The dynptr length is out of bounds
++ *   -EOPNOTSUPP - The dynptr is not of type XDP or SKB
++ *   -EMSGSIZE - The packet exceeds the maximum allowed size or is too fragmented
++ *   -EBADMSG - The decryption operation failed
++ *   -EPROTO - The nonce counter validation failed
++ */
++__bpf_kfunc long
++bpf_wolf_decrypt(struct bpf_dynptr *ptr, struct noise_keypair *keypair, u64 counter)
++{
++	struct bpf_dynptr_kern *ptr_kern = (struct bpf_dynptr_kern *)ptr;
++	struct wg_peer *peer = keypair->entry.peer;
++	struct scatterlist sg[MAX_SKB_FRAGS + 8];
++	u32 length;
++	long ret;
++
++	if (unlikely(!ptr_kern->data || __bpf_dynptr_is_rdonly(ptr_kern)))
++		return -EINVAL;
++
++	length = __bpf_dynptr_size(ptr_kern);
++	if (unlikely(length <= noise_encrypted_len(0)))
++		return -EINVAL;
++
++	if (unlikely(!READ_ONCE(keypair->receiving.is_valid)))
++		return -EKEYEXPIRED;
++
++	if (unlikely(wg_birthdate_has_expired(keypair->receiving.birthdate,
++					      REJECT_AFTER_TIME) ||
++		     READ_ONCE(keypair->receiving_counter.counter) >=
++			     REJECT_AFTER_MESSAGES)) {
++		WRITE_ONCE(keypair->receiving.is_valid, false);
++		return -EKEYEXPIRED;
++	}
++
++	ret = bpf_dynptr_to_sgvec(ptr_kern, sg, ARRAY_SIZE(sg));
++	if (unlikely(ret < 0))
++		return ret;
++
++	if (unlikely(!wc_AesGcm_decrypt_sg_inplace(sg,
++		    length, NULL, 0, counter, keypair->receiving.key,
++		    sizeof(keypair->receiving.key))))
++		return -EBADMSG;
++
++	if (unlikely(!wg_noise_counter_validate(&keypair->receiving_counter,
++						counter)))
++		return -EPROTO;
++
++	wg_noise_receive_keep_key_fresh(peer);
++	wg_timers_any_authenticated_packet_received(peer);
++	wg_timers_any_authenticated_packet_traversal(peer);
++	return 0;
++}
++
++/**
++ * bpf_wolf_device_put() - Release wolfguard device.
++ * @wg: WolfGuard device pointer.
++ *
++ * Decrements the reference count of the wolfguard device @wg previously
++ * acquired by a bpf_*_wolf_device_get_* kfunc.
++ */
++__bpf_kfunc void
++bpf_wolf_device_put(struct wg_device *wg)
++{
++	dev_put(wg->dev);
++}
++
++/**
++ * bpf_wolf_peer_put() - Release wolfguard peer.
++ * @peer: WolfGuard peer pointer.
++ *
++ * Decrements the reference count of the wolfguard peer @peer previously
++ * acquired by a bpf_wolf_peer_*_lookup kfunc.
++ */
++__bpf_kfunc void
++bpf_wolf_peer_put(struct wg_peer *peer)
++{
++	wg_peer_put(peer);
++}
++
++/**
++ * bpf_wolf_keypair_put() - Release wolfguard keypair.
++ * @keypair: WolfGuard keypair pointer.
++ *
++ * Decrements the reference count of the wolfguard keypair @keypair previously
++ * acquired by a bpf_wolf_keypair_*_lookup and its belonging peer kfunc.
++ */
++__bpf_kfunc void
++bpf_wolf_keypair_put(struct noise_keypair *keypair)
++{
++	struct wg_peer *peer = keypair->entry.peer;
++
++	wg_noise_keypair_put(keypair, false);
++	wg_peer_put(peer);
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(wolf_kfunc_set)
++BTF_ID_FLAGS(func, bpf_xdp_wolf_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_skb_wolf_device_get_by_index, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_wolf_device_get_from_sk,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_peer_allowedips_lookup,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_keypair_hashtable_lookup,
++	     KF_ACQUIRE | KF_RET_NULL | KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_endpoint_tuple_get, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_encrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_decrypt, KF_TRUSTED_ARGS)
++BTF_ID_FLAGS(func, bpf_wolf_device_put, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_wolf_peer_put, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_wolf_keypair_put, KF_RELEASE)
++BTF_KFUNCS_END(wolf_kfunc_set)
++
++static const struct btf_kfunc_id_set wolfguard_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set = &wolf_kfunc_set,
++};
++
++int __init register_wolfguard_bpf(void)
++{
++	int ret;
++
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
++					&wolfguard_kfunc_set);
++	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
++					&wolfguard_kfunc_set);
++	return ret;
++}
+diff --git a/kernel-src/bpf.h b/kernel-src/bpf.h
+new file mode 100644
+index 0000000..947e5cd
+--- /dev/null
++++ b/kernel-src/bpf.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _WOLF_BPF_H
++#define _WOLF_BPF_H
++
++#include <linux/init.h>
++#include <linux/kconfig.h>
++
++#if (!defined(MODULE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
++    (defined(MODULE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
++int __init register_wolfguard_bpf(void);
++#else
++static inline int __init register_wolfguard_bpf(void)
++{
++	return 0;
++}
++#endif
++
++#endif /* _WOLF_BPF_H */
+diff --git a/kernel-src/device.c b/kernel-src/device.c
+index 484e393..f0aa0f7 100644
+--- a/kernel-src/device.c
++++ b/kernel-src/device.c
+@@ -574,3 +574,20 @@ void wg_device_uninit(void)
+ #endif
+ 	rcu_barrier();
+ }
++
++struct wg_device *
++wg_device_get_by_index(struct net *net, int ifindex)
++{
++	struct wg_device *wg = NULL;
++	struct net_device *dev;
++
++	rcu_read_lock();
++	dev = dev_get_by_index_rcu(net, ifindex);
++	if (dev && dev->netdev_ops == &netdev_ops) {
++		wg = netdev_priv(dev);
++		dev_hold(wg->dev);
++	}
++	rcu_read_unlock();
++
++	return wg;
++}
+diff --git a/kernel-src/device.h b/kernel-src/device.h
+index 59c6aec..3e6c785 100644
+--- a/kernel-src/device.h
++++ b/kernel-src/device.h
+@@ -63,4 +63,6 @@ struct wg_device {
+ int wg_device_init(void);
+ void wg_device_uninit(void);
+ 
++struct wg_device *wg_device_get_by_index(struct net *net, int ifindex);
++
+ #endif /* _WG_DEVICE_H */
+diff --git a/kernel-src/main.c b/kernel-src/main.c
+index fd21e16..79fd24d 100644
+--- a/kernel-src/main.c
++++ b/kernel-src/main.c
+@@ -11,6 +11,7 @@
+ #include "queueing.h"
+ #include "ratelimiter.h"
+ #include "netlink.h"
++#include "bpf.h"
+ #include "uapi/wolfguard.h"
+ 
+ #include <linux/init.h>
+@@ -47,12 +48,18 @@ static int __init mod_init(void)
+ 	if (ret < 0)
+ 		goto err_netlink;
+ 
++	ret = register_wolfguard_bpf();
++	if (ret < 0)
++		goto err_bpf;
++
+ 	pr_info("WolfGuard " WOLFGUARD_VERSION " loaded.  Contact info@wolfssl.com for information.\n");
+ 	pr_info("WireGuard Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.\n");
+ 	pr_info("WolfGuard Copyright (C) 2020-2026 wolfSSL Inc. <info@wolfssl.com>\n");
+ 
+ 	return 0;
+ 
++err_bpf:
++	wg_genetlink_uninit();
+ err_netlink:
+ 	wg_device_uninit();
+ 
+diff --git a/kernel-src/netlink.c b/kernel-src/netlink.c
+index 87e51db..d8ded0c 100644
+--- a/kernel-src/netlink.c
++++ b/kernel-src/netlink.c
+@@ -920,7 +920,7 @@ int __init wg_genetlink_init(void)
+ 	WC_DEBUG_PR_NEG_RET(genl_register_family(&genl_family));
+ }
+ 
+-void __exit wg_genetlink_uninit(void)
++void wg_genetlink_uninit(void)
+ {
+ 	genl_unregister_family(&genl_family);
+ }
+diff --git a/kernel-src/noise.h b/kernel-src/noise.h
+index c5e055e..67740ea 100644
+--- a/kernel-src/noise.h
++++ b/kernel-src/noise.h
+@@ -135,4 +135,9 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
+ bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
+ 				      struct noise_keypairs *keypairs);
+ 
++bool wg_noise_counter_validate(struct noise_replay_counter *counter,
++			       u64 their_counter);
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer);
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer);
++
+ #endif /* _WG_NOISE_H */
+diff --git a/kernel-src/receive.c b/kernel-src/receive.c
+index 07e76a8..ff77cb1 100644
+--- a/kernel-src/receive.c
++++ b/kernel-src/receive.c
+@@ -245,7 +245,7 @@ void wg_packet_handshake_receive_worker(struct work_struct *work)
+ 	}
+ }
+ 
+-static void keep_key_fresh(struct wg_peer *peer)
++void wg_noise_receive_keep_key_fresh(struct wg_peer *peer)
+ {
+ 	struct noise_keypair *keypair;
+ 	bool send;
+@@ -321,7 +321,7 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ }
+ 
+ /* This is RFC6479, a replay detection bitmap algorithm that avoids bitshifts */
+-static bool counter_validate(struct noise_replay_counter *counter, u64 their_counter)
++bool wg_noise_counter_validate(struct noise_replay_counter *counter, u64 their_counter)
+ {
+ 	unsigned long index, index_current, top, i;
+ 	bool ret = false;
+@@ -377,7 +377,7 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
+ 		wg_packet_send_staged_packets(peer);
+ 	}
+ 
+-	keep_key_fresh(peer);
++	wg_noise_receive_keep_key_fresh(peer);
+ 
+ 	wg_timers_any_authenticated_packet_received(peer);
+ 	wg_timers_any_authenticated_packet_traversal(peer);
+@@ -491,7 +491,7 @@ int wg_packet_rx_poll(struct napi_struct *napi, int budget)
+ 		if (unlikely(state != PACKET_STATE_CRYPTED))
+ 			goto next;
+ 
+-		if (unlikely(!counter_validate(&keypair->receiving_counter,
++		if (unlikely(!wg_noise_counter_validate(&keypair->receiving_counter,
+ 					       PACKET_CB(skb)->nonce))) {
+ 			net_dbg_ratelimited("%s: Packet has invalid nonce %llu (max %llu)\n",
+ 					    peer->device->dev->name,
+diff --git a/kernel-src/selftest/counter.c b/kernel-src/selftest/counter.c
+index ec3c156..db9baa7 100644
+--- a/kernel-src/selftest/counter.c
++++ b/kernel-src/selftest/counter.c
+@@ -23,7 +23,7 @@ bool __init wg_packet_counter_selftest(void)
+ #define T_LIM (COUNTER_WINDOW_SIZE + 1)
+ #define T(n, v) do {                                                  \
+ 		++test_num;                                           \
+-		if (counter_validate(counter, n) != (v)) {            \
++		if (wg_noise_counter_validate(counter, n) != (v)) {            \
+ 			pr_err("nonce counter self-test %u: FAIL\n",  \
+ 			       test_num);                             \
+ 			success = false;                              \
+diff --git a/kernel-src/send.c b/kernel-src/send.c
+index 62f05fd..8d5e90d 100644
+--- a/kernel-src/send.c
++++ b/kernel-src/send.c
+@@ -188,7 +188,7 @@ int wg_packet_send_handshake_cookie(struct wg_device *wg,
+ 					      sizeof(packet));
+ }
+ 
+-static void keep_key_fresh(struct wg_peer *peer)
++void wg_noise_send_keep_key_fresh(struct wg_peer *peer)
+ {
+ 	struct noise_keypair *keypair;
+ 	bool send;
+@@ -324,7 +324,7 @@ static void wg_packet_create_data_done(struct sk_buff *first,
+ 	if (likely(data_sent))
+ 		wg_timers_data_sent(peer);
+ 
+-	keep_key_fresh(peer);
++	wg_noise_send_keep_key_fresh(peer);
+ }
+ 
+ void wg_packet_tx_worker(struct work_struct *work)
+diff --git a/kernel-src/socket.c b/kernel-src/socket.c
+index 42d339f..885d0fd 100644
+--- a/kernel-src/socket.c
++++ b/kernel-src/socket.c
+@@ -478,3 +478,19 @@ void wg_socket_reinit(struct wg_device *wg, struct sock *new4,
+ 	sock_free(old4);
+ 	sock_free(old6);
+ }
++
++struct wg_device *wg_socket_device_get_from_sk(struct sock *sk)
++{
++	struct wg_device *wg;
++
++	if (READ_ONCE(udp_sk(sk)->encap_rcv) != wg_receive)
++		return NULL;
++
++	rcu_read_lock();
++	wg = rcu_dereference_sk_user_data(sk);
++	if (likely(wg))
++		dev_hold(wg->dev);
++	rcu_read_unlock();
++
++	return wg;
++}
+diff --git a/kernel-src/socket.h b/kernel-src/socket.h
+index e2d910c..aaf47a5 100644
+--- a/kernel-src/socket.h
++++ b/kernel-src/socket.h
+@@ -32,6 +32,8 @@ void wg_socket_set_peer_endpoint_from_skb(struct wg_peer *peer,
+ 					  const struct sk_buff *skb);
+ void wg_socket_clear_peer_endpoint_src(struct wg_peer *peer);
+ 
++struct wg_device *wg_socket_device_get_from_sk(struct sock *sk);
++
+ #if defined(CONFIG_DYNAMIC_DEBUG) || defined(DEBUG)
+ #define net_dbg_skb_ratelimited(fmt, dev, skb, ...) do {                       \
+ 		struct endpoint __endpoint;                                    \
+-- 
+2.55.0
+

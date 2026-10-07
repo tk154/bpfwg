@@ -16,7 +16,10 @@ RSS programs.
 - `src/kernel/dsa/`: DSA-specific L2 parsing and transmit helpers.
 - `src/kernel/rss/`: optional XDP programs that redirect packets through a CPU map.
 - `src/user/`: libbpf/libmnl loader, argument parsing, logging, and OpenWrt build helper.
-- `patches/`: kernel patches required by the BPF WireGuard/checksum helpers.
+- `patches/linux/`: shared Linux checksum and dynptr helper patches.
+- `patches/wireguard/`: in-tree WireGuard kfunc and peer accounting patches.
+- `patches/wolfguard/`: WolfGuard kfunc and peer accounting patches for the
+  separate WolfGuard repository.
 
 ## Build
 
@@ -51,16 +54,45 @@ Linux and libbpf headers. The userspace loader links against `libbpf`, `libelf`,
 the host or target staging environment. Use a libbpf version that supports TCX
 (`bpf_program__attach_tcx()`) and a kernel with TCX ingress support.
 
-The WireGuard datapath requires the kernel patches in `patches/`, applied in
-numeric order to a compatible kernel tree and built with WireGuard and BPF
-support:
+Both backends require the shared patches in `patches/linux/`. The Linux patch
+base is **`v6.18.41`**. Apply the shared series in numeric order to a Linux tree
+checked out at that tag:
 
 1. `0001`: dynptr-based checksums for XDP and SKB packet data.
 2. `0002`: dynptr helper visibility and size export for kernel modules.
 3. `0003`: dynptr-to-scatterlist conversion for packet cryptography.
-4. `0004`: WireGuard device, peer, keypair, endpoint, and crypto kfuncs.
-5. `0005`: explicit WireGuard traffic/error accounting kfuncs and atomic peer
+
+For the WireGuard backend, then apply `patches/wireguard/` in numeric order to
+the same Linux tree:
+
+1. `0004`: WireGuard device, peer, keypair, endpoint, and crypto kfuncs.
+2. `0005`: explicit WireGuard peer traffic accounting kfuncs and atomic peer
    byte counters.
+
+For the WolfGuard backend, apply `patches/wolfguard/` in numeric order to the
+separate WolfGuard repository:
+
+1. `0001`: WolfGuard device, peer, keypair, endpoint, and AES-GCM crypto kfuncs.
+2. `0002`: explicit WolfGuard peer traffic accounting kfuncs and atomic peer
+   byte counters.
+
+For example, with this repository at `/path/to/bpfwg`:
+
+```sh
+# Shared helpers: apply to Linux v6.18.41 for either backend.
+git -C /path/to/linux am /path/to/bpfwg/patches/linux/*.patch
+
+# WireGuard backend: apply to the same Linux tree after the shared helpers.
+git -C /path/to/linux am /path/to/bpfwg/patches/wireguard/*.patch
+
+# WolfGuard backend: apply to the separate WolfGuard repository.
+git -C /path/to/wolfguard am /path/to/bpfwg/patches/wolfguard/*.patch
+```
+
+Build the patched Linux tree with BPF support and WireGuard enabled when using
+the WireGuard backend. For WolfGuard, build the module against the patched
+kernel's build artifacts. Both backend series can be used together when
+building both variants.
 
 Conntrack mode additionally requires the kernel's BPF conntrack lookup and
 timeout-change kfuncs, and readable conntrack timeout sysctls.
@@ -244,7 +276,7 @@ outgoing UDP tunnel checksums.
 
 ### Explicit Traffic Accounting
 
-Patch `0005` exposes these additional kfuncs:
+WireGuard patch `patches/wireguard/0005` exposes these additional kfuncs:
 
 ```c
 int bpf_wg_peer_update_rx_stats(struct noise_keypair *keypair, __u32 message_len);
