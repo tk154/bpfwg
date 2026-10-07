@@ -52,10 +52,8 @@ int wg_decrypt_path(struct packet_data *pkt, struct packet_header *header,
     int ret;
 
     ret = wg_decrypt(pkt, header, wg_sock, &inner);
-    bpf_sk_release(wg_sock);
-
     if (ret != WG_ACTION_REDIRECT)
-        return ret;
+        goto bpf_sk_release;
 
     if (config.conntrack) {
         if (!parse_l4_header(pkt, inner.l3.proto, &inner.l4)) {
@@ -82,6 +80,8 @@ bpf_adjust_packet:
         ret = WG_ACTION_DROP;
     }
 
+bpf_sk_release:
+    bpf_sk_release(wg_sock);
     return ret;
 }
 
