@@ -237,9 +237,8 @@ int bpf_wg_peer_update_tx_stats(struct wg_peer *peer, __u32 message_len);
 `message_len` includes the WireGuard data header, padding, and authentication
 tag, and excludes UDP/IP headers. RX accounting updates peer received bytes
 after authentication, replay validation, inner-packet validation, and AllowedIPs
-checks. TX accounting updates peer transmitted bytes at the transmit commit
-point. A call before redirect counts a transmit attempt and cannot observe
-later output failures. Lengths of 32 bytes or less, including empty-payload
+checks. TX accounting updates peer transmitted bytes for messages prepared
+for transmission. Lengths of 32 bytes or less, including empty-payload
 keepalives, return `-EINVAL` without changing counters, matching the crypto
 kfuncs' rejection of empty payloads.
 
@@ -249,9 +248,10 @@ packet, byte, error, or drop counters.
 
 The datapath calls RX accounting after validating the authenticated inner
 packet and its source AllowedIPs, using the original message length before
-padding/tag removal. TX accounting runs after encapsulation and output lookup
-select a redirect, while the peer reference is still held.
-Conntrack and routing fallbacks are not counted as TX success.
+padding/tag removal. TX accounting runs after successful encryption and
+WireGuard data header construction, before releasing the peer reference.
+It includes messages later passed to the stack or dropped during UDP/IP
+header construction or output processing, and does not confirm delivery.
 
 ### Reference Release
 
