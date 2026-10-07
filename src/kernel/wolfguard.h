@@ -1,0 +1,21 @@
+#ifndef WOLFGUARD_H
+#define WOLFGUARD_H
+
+/* Rename declarations and calls before including the shared datapath. */
+#define bpf_xdp_wg_device_get_by_index bpf_xdp_wolf_device_get_by_index
+#define bpf_skb_wg_device_get_by_index bpf_skb_wolf_device_get_by_index
+#define bpf_wg_device_get_from_sk bpf_wolf_device_get_from_sk
+#define bpf_wg_peer_allowedips_lookup bpf_wolf_peer_allowedips_lookup
+#define bpf_wg_keypair_hashtable_lookup bpf_wolf_keypair_hashtable_lookup
+#define bpf_wg_endpoint_tuple_get bpf_wolf_endpoint_tuple_get
+#define bpf_wg_encrypt bpf_wolf_encrypt
+#define bpf_wg_decrypt bpf_wolf_decrypt
+#define bpf_wg_peer_update_rx_stats bpf_wolf_peer_update_rx_stats
+#define bpf_wg_peer_update_tx_stats bpf_wolf_peer_update_tx_stats
+#define bpf_wg_device_put bpf_wolf_device_put
+#define bpf_wg_peer_put bpf_wolf_peer_put
+#define bpf_wg_keypair_put bpf_wolf_keypair_put
+
+#include "wireguard.h"
+
+#endif

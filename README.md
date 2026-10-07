@@ -26,7 +26,18 @@ Build the BPF object files:
 make -C src/kernel
 ```
 
-This produces little-endian and big-endian objects in `src/kernel/obj/`.
+This defaults to the `wireguard` target and produces `src/kernel/obj/wg_le.o`
+and `src/kernel/obj/wg_be.o`.
+
+Build the WolfGuard variants with the same datapath and WolfGuard kfuncs:
+
+```sh
+make -C src/kernel wolfguard
+```
+
+This produces `src/kernel/obj/wolf_le.o` and `src/kernel/obj/wolf_be.o`.
+To build both backends together, run `make -C src/kernel -j all`.
+The default build continues to produce the WireGuard objects.
 
 Build the userspace loader:
 
@@ -93,7 +104,13 @@ Examples:
 src/user/bin/host/bpfwg tc eth0 -o src/kernel/obj/wg_le.o
 src/user/bin/host/bpfwg xdpnative eth0 eth1 -o src/kernel/obj/wg_le.o -r rx_hash -e 0
 src/user/bin/host/bpfwg xdp lan1 -o src/kernel/obj/wg_le.o --conntrack --udp
+src/user/bin/host/bpfwg xdpnative eth0 -o src/kernel/obj/wolf_le.o
 ```
+
+Select the object matching the host's endianness. WolfGuard objects require
+the WolfGuard module with its eBPF API enabled and the shared checksum/dynptr
+kernel helpers; load the module before starting the loader. Program and map
+names are shared by both variants, so the same loader supports either backend.
 
 The loader stays in the foreground and detaches the programs when it receives
 `SIGINT` or `SIGTERM`. TCX links are destroyed on detach, leaving other TC

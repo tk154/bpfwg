@@ -10,7 +10,11 @@
 #include "common_kern.h"
 #include "config.h"
 
+#ifdef WOLFGUARD
+#include "wolfguard.h"
+#else
 #include "wireguard.h"
+#endif
 #include "receive.h"
 #include "transmit.h"
 
